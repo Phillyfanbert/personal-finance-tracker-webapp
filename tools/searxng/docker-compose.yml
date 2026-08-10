@@ -1,0 +1,27 @@
+# ============================================================================
+# SearXNG - F6 stretch.
+# Deliberately NOT set to restart automatically: this stays stopped between
+# runs. tools/run-deal-agent.sh brings it up right before a run and tears it
+# down right after, so it never sits resident consuming RAM between the
+# weekly agent runs (see the RAM/compute discussion - steady-state cost
+# should be ~0, not a background service).
+#
+# First-time setup (run once, from this directory):
+#   docker compose up -d
+#   docker compose down
+#   (this bootstraps default config into ./searxng-config/settings.yml)
+#
+# Then edit ./searxng-config/settings.yml:
+#   - under `search:`, add `formats: [html, json]` (JSON is off by default)
+#   - set `server: secret_key:` to a random value, e.g. `openssl rand -hex 32`
+# ============================================================================
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: deal-agent-searxng
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./searxng-config:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/

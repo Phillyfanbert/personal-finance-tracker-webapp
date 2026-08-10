@@ -1,0 +1,12 @@
+-- Archiving an account (soft-close) instead of deleting it keeps its past
+-- expenses/account_activity rows correctly attributed - deleting sets
+-- their account_id to null instead (accounts_*_fkey on delete set null,
+-- 01_schema.sql / 18_account_activity_account_link.sql), silently
+-- stripping their account context. An archived account is simply
+-- excluded from the "how did you pay for this" pickers (app.js
+-- loadAccounts) - it stays fully visible/adjustable in the Accounts card
+-- and selectable in every historical/filter context, same treatment
+-- NON_SPENDABLE_ACCOUNT_TYPES already gets for a different reason. Its
+-- linked asset/liability is left completely untouched - archiving never
+-- changes net worth as a side effect.
+alter table accounts add column if not exists archived_at timestamptz;

@@ -1,0 +1,14 @@
+-- ============================================================================
+-- Supports undoing an account_activity row (app.js's undoActivity()).
+--
+-- liability_id: a liability_payment against a STANDALONE liability (no
+-- linked account - Loan/Mortgage/Other, added directly in the
+-- Liabilities card) has no account on the liability side at all, so
+-- related_account_id (added in 18_account_activity_account_link.sql) is
+-- null for it - there was no way to know which liability was paid down
+-- well enough to reverse it. Stores the liability directly instead of
+-- relying on account linkage, which only works for the credit-linked
+-- case. Set null (not delete) if the liability is later removed, same
+-- pattern as every other FK on this table.
+-- ============================================================================
+alter table account_activity add column if not exists liability_id uuid references liabilities(id) on delete set null;

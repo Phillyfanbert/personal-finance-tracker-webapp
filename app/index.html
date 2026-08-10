@@ -1,0 +1,1122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Expenses" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="512x512" href="icons/icon-512.png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <title>Personal Finance Tracker</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel: #1e293b; --panel-2: #273449;
+      --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --accent-2: #0ea5e9;
+      --ok: #34d399; --err: #f87171; --warn: #fbbf24; --border: #334155;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      margin: 0; font-family: -apple-system, system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+      padding: env(safe-area-inset-top) 0 calc(72px + env(safe-area-inset-bottom));
+    }
+    .wrap { max-width: 560px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 20px; margin: 8px 0 16px; }
+    .muted { color: var(--muted); }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+    input, select, button, textarea {
+      font: inherit; width: 100%; padding: 13px 14px; border-radius: 10px;
+      border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+    }
+    input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); }
+    label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+    button { background: var(--accent-2); border: none; color: #002233; font-weight: 700; cursor: pointer; }
+    button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); font-weight: 500; }
+    .row { display: flex; gap: 10px; }
+    .row > * { flex: 1; }
+    .hidden { display: none !important; }
+    .quickadd input { font-size: 18px; padding: 16px; }
+    /* Above .modal (70) - a toast fired while a modal is open (e.g. "not
+       enough in this asset" from the Pay form) must render on top of its
+       dark overlay, not invisibly behind it. */
+    .toast { position: fixed; left: 50%; bottom: 88px; transform: translateX(-50%);
+      background: var(--panel-2); border: 1px solid var(--border); padding: 12px 18px;
+      border-radius: 10px; opacity: 0; transition: opacity .2s; z-index: 80; max-width: 90%; }
+    .toast.show { opacity: 1; }
+    .exp { display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 0; border-bottom: 1px solid var(--border); gap: 10px; cursor: pointer; }
+    .exp:last-child { border-bottom: none; }
+    /* Caps a long expense list instead of letting it push everything below
+       it down the page - Recent Transactions (Log) and the Reports month log. */
+    .scroll-list { max-height: 360px; overflow-y: auto; }
+    .exp .meta { font-size: 13px; color: var(--muted); }
+    .exp .amt { font-weight: 700; white-space: nowrap; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 10px; border-radius: 999px; background: var(--panel-2); color: var(--text); border: 1px solid var(--border); margin: 2px 0; }
+    .pill .x { color: var(--err); cursor: pointer; font-weight: 700; }
+    /* Accounts: bigger circular badges so every payment method is visible at a glance */
+    .acct-circles { display: flex; flex-wrap: wrap; gap: 18px; }
+    .acct-circle-item { position: relative; display: flex; flex-direction: column; align-items: center; width: 76px; text-align: center; }
+    .acct-circle { width: 64px; height: 64px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 22px; color: #fff; }
+    .acct-circle-item .name { font-size: 12px; margin-top: 6px; color: var(--text); word-break: break-word; }
+    .acct-circle-item .type { font-size: 11px; color: var(--muted); }
+    .acct-circle-item .balance { font-size: 12px; font-weight: 700; color: var(--text); margin-top: 2px; }
+    .acct-circle-item .x { position: absolute; top: -2px; right: 2px; background: var(--err); color: #fff;
+      width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 700; cursor: pointer; border: 2px solid var(--panel); }
+    .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .totals { display: flex; gap: 12px; margin-bottom: 14px; }
+    .totals .card { flex: 1; text-align: center; margin: 0; }
+    .totals .big { font-size: 22px; font-weight: 800; }
+    .chartbox { position: relative; height: 240px; }
+    .chartbox.short { height: 200px; }
+    /* Bottom nav */
+    .nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+      display: flex; background: var(--panel); border-top: 1px solid var(--border);
+      padding-bottom: env(safe-area-inset-bottom); }
+    .nav button { flex: 1; background: transparent; border: none; color: var(--muted);
+      font-weight: 600; padding: 16px 0; border-radius: 0; }
+    .nav button.active { color: var(--accent); }
+    /* Modal */
+    .modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 70;
+      display: flex; align-items: flex-end; justify-content: center; }
+    .modal .sheet { background: var(--panel); width: 100%; max-width: 560px;
+      border-radius: 16px 16px 0 0; border: 1px solid var(--border); padding: 18px;
+      max-height: 90vh; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+
+    <!-- ============ AUTH VIEW ============ -->
+    <div id="authView">
+      <h1>Personal Finance Tracker</h1>
+      <div class="card">
+        <p class="muted">Sign in with your password. Haven't set one yet? Send yourself a magic link below, then set a password from Profile once you're in.</p>
+        <label for="email">Email</label>
+        <input id="email" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com" />
+        <div style="height:10px"></div>
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" placeholder="Password" />
+        <div style="height:10px"></div>
+        <button id="passwordSignInBtn">Sign in</button>
+        <p id="passwordAuthMsg" class="muted" style="margin-top:12px"></p>
+        <div class="muted" style="text-align:center;font-size:12px;margin:16px 0">or</div>
+        <button class="secondary" id="signInBtn">Send magic link instead</button>
+        <p id="authMsg" class="muted" style="margin-top:12px"></p>
+      </div>
+      <!-- iOS gives a home-screen icon its own storage, separate from
+           Safari - a magic link always opens in Safari, so a session from
+           it can never reach an installed icon (the icon stays permanently
+           signed out no matter how many links you click). Signing in with
+           a password happens in whichever window is already open, so it's
+           the only path that actually keeps the installed icon signed in. -->
+      <p class="muted" style="font-size:12px">First time on iPhone? After signing in, tap Share → “Add to Home Screen” to install. Use your password (not a magic link) to sign in on the installed icon, or it won't stay signed in.</p>
+    </div>
+
+    <!-- ============ APP: LOG VIEW ============ -->
+    <div id="logView" class="hidden">
+      <!-- flex-wrap here (not on .topbar generally, used by every card
+           header) - the longer title needs to drop to its own line above
+           the buttons on narrow screens rather than fighting them for
+           space in a single row. -->
+      <div class="topbar" style="flex-wrap:wrap;gap:8px">
+        <h1 style="margin:0;font-size:17px">Personal Finance Tracker</h1>
+        <div style="display:flex;gap:8px">
+          <button class="secondary" id="profileBtn" style="width:auto;padding:8px 12px">Profile</button>
+          <button class="secondary" id="signOutBtn" style="width:auto;padding:8px 12px">Sign out</button>
+        </div>
+      </div>
+
+      <div class="totals">
+        <div class="card"><div class="muted" style="font-size:12px">This month</div><div class="big" id="monthTotal">$0</div></div>
+        <div class="card"><div class="muted" style="font-size:12px">Entries</div><div class="big" id="monthCount">0</div></div>
+      </div>
+
+      <!-- Proactive, not something you have to open Reports to see - a
+           category at/over its budget (renderBudgetWarnings, app.js).
+           Same threshold (90%+, or over) also drives the matching toast
+           fired right when a save actually crosses it. -->
+      <div id="budgetWarningNotice" class="card hidden" style="border-color:var(--err)">
+        <strong style="color:var(--err)">Budget warning</strong>
+        <div id="budgetWarningList" style="margin-top:6px;font-size:13px"></div>
+      </div>
+
+      <!-- Quick add -->
+      <div class="card quickadd">
+        <strong>Expenses Quick Add</strong>
+        <label for="quick" class="hidden">Quick add</label>
+        <input id="quick" placeholder="$14 lunch chipotle debit" autocomplete="off" style="margin-top:8px" />
+        <p class="muted" style="font-size:12px;margin:8px 0 0">Type free text: amount & merchant are auto-detected, and a matching account if you name one (e.g. "debit"). Confirm below.</p>
+
+        <div id="confirm" class="hidden" style="margin-top:12px">
+          <div id="parseStatus" class="muted" style="font-size:12px;min-height:16px;margin-bottom:6px"></div>
+          <div class="row">
+            <div><label>Amount</label><input id="fAmount" type="number" step="0.01" inputmode="decimal" /></div>
+            <div><label>Account</label><select id="fAccount"></select></div>
+          </div>
+          <!-- Amount/Account/Category/Date are all required (see saveBtn,
+               app.js) - Description is the only optional field here. -->
+          <label>Description / merchant (optional)</label>
+          <input id="fDesc" />
+          <div class="row">
+            <div><label>Category</label><select id="fCategory"></select></div>
+            <div><label>Date</label><input id="fDate" type="date" /></div>
+          </div>
+          <div style="height:12px"></div>
+          <div class="row">
+            <button id="saveBtn">Save expense</button>
+            <button class="secondary" id="cancelBtn">Cancel</button>
+          </div>
+        </div>
+        <button class="secondary" id="openCsvImportBtn" style="width:auto;padding:6px 10px;font-size:12px;margin-top:10px">Import CSV</button>
+      </div>
+
+      <!-- Expense list -->
+      <div class="card">
+        <strong>Recent Transactions</strong>
+        <!-- Four independent filters, all AND-ed together (see
+             filteredTransactions in app.js). A label above each one names
+             what it filters by, so the option text itself can just say
+             "All" instead of repeating it ("All types", "All kinds", ...)
+             - that repetition was also what made "Expenses + activity"
+             too long for its box and overlap the dropdown arrow. Type/
+             Account/Category options are populated from what's actually
+             in use, not the full ~42-type list or every category that
+             exists - most users only ever touch a handful. Account
+             activity rows (payments, balance adjustments) have no
+             payment_type or category, so they drop out of the list under
+             those two filters, and under Kind unless "Activity only" is
+             picked there. -->
+        <div style="margin-top:8px">
+          <label style="margin:0 0 4px">Search</label>
+          <input id="txnSearch" placeholder="Search merchant or description..." style="width:100%;font-size:13px;padding:6px 8px" autocomplete="off" />
+        </div>
+        <div class="row" style="flex-wrap:wrap;gap:6px 10px;margin-top:8px;align-items:flex-end">
+          <div style="flex:1;min-width:110px">
+            <label style="margin:0 0 4px">Type</label>
+            <select id="txnTypeFilter" style="width:100%;font-size:12px;padding:6px 8px;text-overflow:ellipsis">
+              <option value="">All</option>
+            </select>
+          </div>
+          <div style="flex:1;min-width:110px">
+            <label style="margin:0 0 4px">Account</label>
+            <select id="txnAccountFilter" style="width:100%;font-size:12px;padding:6px 8px;text-overflow:ellipsis">
+              <option value="">All</option>
+            </select>
+          </div>
+          <div style="flex:1;min-width:110px">
+            <label style="margin:0 0 4px">Category</label>
+            <select id="txnCategoryFilter" style="width:100%;font-size:12px;padding:6px 8px;text-overflow:ellipsis">
+              <option value="">All</option>
+            </select>
+          </div>
+          <div style="flex:1;min-width:110px">
+            <label style="margin:0 0 4px">Kind</label>
+            <select id="txnKindFilter" style="width:100%;font-size:12px;padding:6px 8px;text-overflow:ellipsis">
+              <option value="">All</option>
+              <option value="expense">Expenses only</option>
+              <option value="activity">Activity only</option>
+            </select>
+          </div>
+          <div style="flex:1;min-width:80px">
+            <label style="margin:0 0 4px">Min $</label>
+            <input id="txnMinAmount" type="number" step="0.01" inputmode="decimal" placeholder="0" style="width:100%;font-size:12px;padding:6px 8px" />
+          </div>
+          <div style="flex:1;min-width:80px">
+            <label style="margin:0 0 4px">Max $</label>
+            <input id="txnMaxAmount" type="number" step="0.01" inputmode="decimal" placeholder="Any" style="width:100%;font-size:12px;padding:6px 8px" />
+          </div>
+        </div>
+        <p class="muted" style="font-size:12px;margin:8px 0 0">Tap an expense to edit or recategorize, or check a few to recategorize them together. Account activity (payments, balance adjustments) is shown for reference only and can't be checked.</p>
+        <!-- Selection persists across filter changes (so refining a search
+             doesn't lose a partially-built selection) - only cleared by
+             Clear, a successful Apply, or a fresh loadExpenses(). -->
+        <div class="row hidden" id="bulkActionBar" style="align-items:center;gap:8px;margin-top:8px;padding:8px;background:var(--panel-2);border-radius:8px">
+          <span class="muted" style="font-size:12px;white-space:nowrap" id="bulkSelectedCount"></span>
+          <select id="bulkCategorySelect" style="flex:1;font-size:12px;padding:6px 8px"></select>
+          <button id="bulkApplyBtn" style="width:auto;padding:6px 12px;font-size:12px">Apply</button>
+          <button class="secondary" id="bulkClearBtn" style="width:auto;padding:6px 12px;font-size:12px">Clear</button>
+        </div>
+        <div id="expList" class="scroll-list" style="margin-top:8px"><p class="muted">Loading…</p></div>
+      </div>
+
+      <!-- Net worth overview -->
+      <div class="card" id="netWorthCard">
+        <div class="muted" style="font-size:12px">Net worth</div>
+        <div class="big" id="netWorthTotal" style="font-size:30px">$0</div>
+      </div>
+
+      <!-- Accounts = payment methods, used to tag expenses. NOT counted in net
+           worth - see Assets below for that. Kept visually + conceptually
+           separate from Assets/Liabilities per that distinction. -->
+      <div class="card">
+        <div class="topbar" style="margin-bottom:4px">
+          <strong>Accounts</strong>
+          <button class="secondary" id="addAcctBtn" style="width:auto;padding:6px 10px;font-size:12px">+ Add</button>
+        </div>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">Payment methods for tagging expenses - not counted in net worth (see Assets below).</p>
+        <div id="acctList" class="acct-circles">
+          <p class="muted" style="font-size:13px">No accounts yet.</p>
+        </div>
+        <div id="acctForm" class="hidden" style="margin-top:10px">
+          <!-- No separate "account name" field - it was always just the
+               type in practice (Checking, Savings, Credit), so the name is
+               derived from Account type below instead of typed twice.
+               ~40 types across 5 categories no longer fit as always-visible
+               toggle buttons (the original design, chosen specifically so a
+               selection couldn't be glanced past - see app.js's
+               populateAcctTypeSelect comment for the history and how the
+               regression is mitigated here instead: a bold "Adding: <type>"
+               summary line that updates with every change). -->
+          <label>Account type</label>
+          <select id="acctType" style="margin-bottom:4px"></select>
+          <p class="muted" style="font-size:13px;margin:4px 0 10px"><strong id="acctTypeSummary">Adding: Checking</strong></p>
+          <label id="acctBankLabel">Bank</label>
+          <!-- <datalist>, not a custom dropdown - it's a native, built-in
+               search-as-you-type combobox (typing filters the list to
+               matches) while still taking free text for a bank not in it,
+               which a plain <select> can't do. Options are populated in
+               loadAccounts() (app.js): common banks plus every bank_name
+               already used on this account, so a previously-typed bank is
+               just as easy to re-select as a seeded one. For a non-bank
+               institution (brokerage, crypto exchange, insurer, plan
+               administrator) this still accepts free text, just without
+               the strict FDIC-bank-name check - see BANK_VALIDATED_
+               CATEGORIES in app.js. -->
+          <input id="acctBank" placeholder="Start typing a bank..." list="bankSuggestions" autocomplete="off" />
+          <datalist id="bankSuggestions"></datalist>
+          <div id="acctAssetLink">
+            <p class="muted" style="font-size:12px;margin:8px 0 0">A new $0 balance is created automatically for this account - edit it below once saved.</p>
+          </div>
+          <div id="acctLiabilityLink" class="hidden">
+            <p class="muted" style="font-size:12px;margin:8px 0 0">Charges tagged with this account add to a liability's balance instead of an asset - a new $0 liability is created automatically to track it.</p>
+          </div>
+          <div style="height:8px"></div>
+          <button id="saveAcctBtn">Save account</button>
+        </div>
+
+        <!-- Tapping any account circle with a linked asset opens this. Every
+             account type gets both ways to adjust its value: a direct "set
+             the full balance" field (look up and type the real number), and
+             +/- for when you just know the change, not the total. Cash is
+             also the only account with no delete option - it's auto-managed
+             (app.js ensureCashAccount). Balances never go negative - every
+             action here is blocked with an error instead. -->
+        <div id="assetAdjustForm" class="hidden" style="margin-top:10px">
+          <div class="muted" style="font-size:12px;margin-bottom:6px"><span id="adjustAssetLabel">Value</span>: <strong id="adjustCurrentValue">$0</strong></div>
+
+          <div id="adjustBankMode">
+            <input id="adjustNewBalance" type="number" step="0.01" inputmode="decimal" placeholder="New balance" />
+            <div style="height:8px"></div>
+            <button id="adjustSetBtn">Save balance</button>
+          </div>
+
+          <div class="muted" style="font-size:12px;margin:12px 0 6px">Or adjust by an amount</div>
+          <div id="adjustDeltaMode">
+            <input id="adjustAmount" type="number" step="0.01" inputmode="decimal" placeholder="Amount" />
+            <div class="row" style="margin-top:8px">
+              <button id="adjustAddBtn">+ Add</button>
+              <button class="secondary" id="adjustSubtractBtn">- Subtract</button>
+            </div>
+          </div>
+
+          <!-- Only shown for a CD-type asset (openAssetAdjust, app.js). -->
+          <div id="adjustMaturitySection" class="hidden" style="margin:12px 0 0">
+            <label>Maturity date</label>
+            <input id="adjustMaturityDate" type="date" />
+            <div style="height:8px"></div>
+            <button class="secondary" id="adjustMaturitySaveBtn">Save maturity date</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Assets = what you own, counted in net worth. Separate from Accounts
+           above (payment methods) even if a bank account appears in both. -->
+      <div class="card">
+        <div class="topbar" style="margin-bottom:4px">
+          <strong>Assets</strong>
+          <span class="muted" style="font-size:12px" id="assetsTotal">$0</span>
+        </div>
+        <p class="muted" style="font-size:12px;margin:0 0 10px">What you own - balances, investments, property. Counted in net worth.</p>
+        <div id="assetsList" class="muted" style="font-size:13px">No assets yet.</div>
+        <!-- Only shown when a CD's maturity_date is within 30 days - see
+             upcomingMaturities() (app.js). -->
+        <div id="assetMaturityNotice" class="hidden muted" style="font-size:12px;margin-top:6px"></div>
+        <!-- Only shown for a manually-valued asset not touched in 6+
+             months - see staleAssets() (app.js). -->
+        <div id="assetStaleNotice" class="hidden muted" style="font-size:12px;margin-top:6px"></div>
+        <button class="secondary" id="addAssetBtn" style="width:auto;padding:6px 10px;font-size:12px;margin-top:10px">+ Add asset</button>
+        <div id="assetForm" class="hidden" style="margin-top:10px">
+          <div class="row">
+            <input id="assetName" placeholder="Vanguard Brokerage" />
+            <!-- The base 4 are standalone-only, no account-type equivalent.
+                 Retirement/investment and specialty groups are appended in
+                 JS (populateAssetTypeSelect, app.js) from the same
+                 ACCOUNT_TYPES config the Accounts card uses, minus the
+                 handful (prepaid/payroll cards, digital wallet, second-
+                 chance checking) that only make sense as a spendable
+                 account, not a standalone value. -->
+            <select id="assetType">
+              <optgroup label="General">
+                <option value="investment">Investment</option><option value="property">Property</option>
+                <option value="vehicle">Vehicle</option><option value="other">Other</option>
+              </optgroup>
+            </select>
+          </div>
+          <label>Value</label>
+          <input id="assetValue" type="number" step="0.01" inputmode="decimal" />
+
+          <!-- Vehicle-only (assetType.onchange, app.js). Filling these in
+               makes net worth use the live depreciation estimate instead of
+               the Value field above - see effectiveAssetValue, depreciation.js. -->
+          <div id="assetDepreciationSection" class="hidden" style="margin-top:8px">
+            <p class="muted" style="font-size:12px;margin:0 0 8px">Estimate this vehicle's current value from its purchase price instead of typing an updated value by hand. Leave blank to keep using Value above.</p>
+            <div class="row">
+              <div><label>Purchase price</label><input id="assetPurchasePrice" type="number" step="0.01" inputmode="decimal" /></div>
+              <div><label>Purchase date</label><input id="assetPurchaseDate" type="date" /></div>
+            </div>
+            <label>Depreciation rate (%/year)</label>
+            <input id="assetDepRate" type="number" step="0.1" min="0" max="100" placeholder="15" />
+            <div class="muted" id="assetDepPreview" style="font-size:12px;margin-top:6px"></div>
+          </div>
+
+          <!-- Optional for any asset type - only used by the live asset
+               price finder (PRICE_FINDINGS_ENABLED). Quantity is required
+               before a live price can be applied, since price alone isn't
+               a total value - see app.js. -->
+          <div class="row" style="margin-top:8px">
+            <div><label>Price symbol (optional)</label><input id="assetPriceSymbol" placeholder="AAPL, BTC, VTSAX" /></div>
+            <div><label>Quantity (optional)</label><input id="assetQuantity" type="number" step="any" inputmode="decimal" /></div>
+          </div>
+
+          <!-- Investment-only (assetType.onchange, app.js). Cost basis is a
+               separate field from the vehicle purchase price above - a
+               holding has no depreciation date/rate to pair it with, just
+               a total amount originally paid, used for the Investments
+               tab's gain/loss math. Bucket feeds that tab's target-
+               allocation calculator, same free-text-plus-suggestions
+               pattern accounts.bank_name/subscriptions.category use. -->
+          <div id="assetInvestmentSection" class="hidden" style="margin-top:8px">
+            <label>Cost basis - total paid (optional)</label>
+            <input id="assetCostBasis" type="number" step="0.01" inputmode="decimal" placeholder="What you originally paid, in total" />
+            <label>Allocation bucket (optional)</label>
+            <input id="assetInvestBucket" list="investBucketSuggestions" placeholder="Stocks, Bonds, Cash..." />
+          </div>
+
+          <div style="height:8px"></div>
+          <div class="row">
+            <button id="saveAssetBtn">Save asset</button>
+            <button class="secondary" id="cancelAssetBtn">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live asset prices - hidden unless PRICE_FINDINGS_ENABLED is set
+           in config.js. Same trust tier as F6's "Found online" card below:
+           machine-found, unverified, applying a price is an explicit tap,
+           never automatic. -->
+      <div class="card hidden" id="assetPriceFindingsCard">
+        <div class="topbar" style="margin-bottom:6px">
+          <strong>Live asset prices</strong>
+          <span class="muted" style="font-size:12px">unverified - tap a link to check the source</span>
+        </div>
+        <div id="assetPriceFindingsList"></div>
+      </div>
+
+      <!-- Liabilities: tracked credit debt only. Subscriptions and a full
+           expense breakdown used to live here too - moved out (Reports has
+           the full expense log + a By-payment-type chart), since neither
+           is actually debt: a subscription is a recurring cost, and debit/
+           cash spending already reduces an asset directly. Total is the
+           full tracked balance (feeds net worth - see networth.js);
+           Monthly is just this month's credit charges, a slice of Total,
+           not a separate pool - see renderNetWorth (app.js). -->
+      <div class="card">
+        <div class="topbar" style="margin-bottom:8px;align-items:flex-start">
+          <strong>Liabilities</strong>
+          <div style="text-align:right">
+            <div class="muted" style="font-size:11px">Total liabilities</div>
+            <div style="font-size:20px;font-weight:800" id="liabilitiesTotal">$0</div>
+            <div class="muted" style="font-size:11px;margin-top:4px">Monthly liabilities</div>
+            <div style="font-size:13px;font-weight:700" id="liabilitiesMonthly">$0</div>
+          </div>
+        </div>
+
+        <!-- A credit account's own liability (linked_liability_id) - balance
+             driven only by real credit expenses, Pay only, no delete/add. -->
+        <div class="muted" style="font-size:12px;margin:4px 0 4px">Credit liabilities</div>
+        <div id="creditDebtsList" class="muted" style="font-size:13px">No credit accounts yet.</div>
+
+        <!-- A standalone Loan/Mortgage/Other with no linked account - the
+             only kind you can add directly below. -->
+        <div class="muted" style="font-size:12px;margin:14px 0 4px">Other liabilities</div>
+        <div id="debtsList" class="muted" style="font-size:13px">No other liabilities.</div>
+        <button class="secondary" id="addDebtBtn" style="width:auto;padding:6px 10px;font-size:12px;margin-top:10px">+ Add</button>
+        <div id="debtForm" class="hidden" style="margin-top:10px">
+          <div class="row">
+            <input id="debtName" placeholder="Chase Sapphire" />
+            <!-- 'loan'/'mortgage'/'other' are the original generic values;
+                 the specific loan types are appended in JS
+                 (populateDebtTypeSelect, app.js) from ACCOUNT_TYPES' Loans
+                 category - a standalone loan (no linked account, since you
+                 don't "spend against" a mortgage the way you do a credit
+                 card) is the more realistic way most of these are actually
+                 tracked. Credit-category types (credit card, HELOC, ...)
+                 stay Accounts-card-only, matching how 'credit' already
+                 worked before this. -->
+            <select id="debtType">
+              <option value="loan">Loan</option>
+              <option value="mortgage">Mortgage</option><option value="other">Other</option>
+            </select>
+          </div>
+          <label>Balance owed</label>
+          <input id="debtBalance" type="number" step="0.01" inputmode="decimal" />
+          <div class="row">
+            <div><label>Interest rate % (optional)</label><input id="debtRate" type="number" step="0.01" inputmode="decimal" /></div>
+            <div><label>Min payment (optional)</label><input id="debtMinPay" type="number" step="0.01" inputmode="decimal" /></div>
+          </div>
+          <label>Due date (optional)</label>
+          <input id="debtDue" type="date" />
+          <div style="height:8px"></div>
+          <button id="saveDebtBtn">Save liability</button>
+        </div>
+
+        <!-- Details for ANY existing liability, standalone or account-
+             linked (a credit card/HELOC never goes through debtForm above
+             at all - it's auto-created with no interest_rate/minimum_
+             payment/due_date, so this was previously the only kind with no
+             way to ever set them). Never touches balance - that stays
+             strictly driven by real expenses/payments, see app.js. -->
+        <div id="debtDetailsForm" class="hidden" style="margin-top:10px">
+          <div class="topbar" style="margin-bottom:6px"><strong>Liability details</strong></div>
+          <div class="row">
+            <div><label>Interest rate % (optional)</label><input id="debtDetailsRate" type="number" step="0.01" inputmode="decimal" /></div>
+            <div><label>Min payment (optional)</label><input id="debtDetailsMinPay" type="number" step="0.01" inputmode="decimal" /></div>
+          </div>
+          <label>Due date (optional)</label>
+          <input id="debtDetailsDue" type="date" />
+          <!-- HELOC-only (openDebtDetailsForm, app.js). -->
+          <div id="debtDetailsDrawSection" class="hidden" style="margin-top:8px">
+            <label>Draw period ends (optional)</label>
+            <input id="debtDetailsDrawEnd" type="date" />
+            <p class="muted" id="debtDetailsPhaseInfo" style="font-size:12px;margin-top:6px"></p>
+          </div>
+          <div style="height:8px"></div>
+          <div class="row">
+            <button id="debtDetailsSaveBtn">Save details</button>
+            <button class="secondary" id="debtDetailsCancelBtn">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ APP: REPORTS VIEW ============ -->
+    <div id="reportsView" class="hidden">
+      <div class="topbar">
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="secondary" id="backFromReports" style="width:auto;padding:8px 10px">←</button>
+          <h1 style="margin:0">Reports</h1>
+        </div>
+        <select id="monthSel" style="width:auto"></select>
+      </div>
+
+      <div class="totals">
+        <div class="card"><div class="muted" style="font-size:12px">Selected month</div><div class="big" id="rptTotal">$0</div></div>
+        <div class="card"><div class="muted" style="font-size:12px">Subscriptions/Bills</div><div class="big" id="rptSubs">$0</div></div>
+      </div>
+
+      <!-- Interactive spending Q&A (Gemma, optional/best-effort like Phase 3) -->
+      <div class="card" id="qaCard">
+        <strong>Ask about your spending</strong>
+        <div class="row" style="margin-top:8px">
+          <input id="qaQuestion" placeholder="e.g. How much did I spend on food last month?" />
+        </div>
+        <button id="qaAskBtn" style="margin-top:8px">Ask</button>
+        <p class="muted" id="qaStatus" style="font-size:12px;margin:8px 0 0"></p>
+        <div id="qaAnswer" class="hidden" style="margin-top:10px;padding:10px;background:var(--panel-2);border-radius:10px;font-size:14px;white-space:pre-wrap"></div>
+      </div>
+
+      <!-- Monthly report, generated by tools/monthly-report.js on the server machine -->
+      <div class="card" id="insightsCard">
+        <strong>Monthly report</strong>
+        <div id="insightsBody" style="margin-top:8px;font-size:14px;white-space:pre-wrap" class="muted">No monthly reports yet.</div>
+      </div>
+
+      <!-- Every expense in the selected month - subscriptions, credit, and
+           debit alike - same row style as the Log page's Recent Transactions,
+           tap to edit. Deliberately expenses only, unlike the Log page's list
+           (no account activity) - this card is about spending for the month,
+           not every balance change. Scrollable so a busy month doesn't push
+           every chart below it far down the page - see renderReports (app.js). -->
+      <div class="card">
+        <div class="topbar" style="margin-bottom:4px">
+          <strong>Monthly Expense Log</strong>
+          <div class="row" style="width:auto;gap:6px">
+            <button class="secondary" id="exportCsvBtn" style="width:auto;padding:5px 10px;font-size:12px">CSV</button>
+            <button class="secondary" id="exportPdfBtn" style="width:auto;padding:5px 10px;font-size:12px">Print / PDF</button>
+          </div>
+        </div>
+        <p class="muted" style="font-size:12px;margin:4px 0 0">Tap an expense to edit or recategorize.</p>
+        <div id="rptExpList" class="scroll-list" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card">
+        <strong>By category</strong>
+        <div class="chartbox"><canvas id="catChart"></canvas></div>
+      </div>
+
+      <!-- An ongoing monthly limit per category, not per-month-varying -
+           set once, applies every month until changed. Scoped to the
+           month selector above, unlike the account-history/net-worth-
+           trend charts, since "over/under budget" is inherently about a
+           specific month's actual spend. -->
+      <div class="card">
+        <strong>Budgets</strong>
+        <div id="budgetsList" style="margin-top:8px"><p class="muted" style="font-size:13px">No budgets set yet.</p></div>
+        <div class="row" style="margin-top:10px">
+          <select id="budgetCategory" style="flex:1"></select>
+          <input id="budgetLimit" type="number" step="0.01" inputmode="decimal" placeholder="Monthly limit" style="flex:1" />
+          <button id="saveBudgetBtn" style="width:auto;padding:6px 12px;font-size:12px">Set</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <strong>By account</strong>
+        <div class="chartbox short"><canvas id="acctChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <strong>By payment type</strong>
+        <div class="chartbox short"><canvas id="payChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <strong>Last 6 months</strong>
+        <div class="chartbox short"><canvas id="trendChart"></canvas></div>
+      </div>
+
+      <!-- Reconstructed from expenses + account_activity (see
+           app/accountHistory.js) rather than a stored snapshot - not
+           scoped to the month selector above, unlike the other charts on
+           this page, since a balance history spans an account's whole
+           lifetime. -->
+      <div class="card">
+        <div class="topbar" style="margin-bottom:6px">
+          <strong>Account balance history</strong>
+          <select id="historyAccountSelect" style="width:auto;font-size:12px"></select>
+        </div>
+        <div class="chartbox short"><canvas id="historyChart"></canvas></div>
+      </div>
+
+      <!-- One snapshot per calendar day the app was actually opened
+           (snapshotNetWorthIfNeeded, app.js) - unlike account balance
+           history, net worth can't be reconstructed from existing rows
+           alone (a standalone asset/liability has no delta trail), so
+           this is a real stored snapshot, not a live reconstruction. Not
+           scoped to the month selector, same reasoning as the account
+           history card above. -->
+      <div class="card">
+        <strong>Net worth trend</strong>
+        <div class="chartbox short"><canvas id="netWorthTrendChart"></canvas></div>
+        <p class="muted" id="netWorthTrendEmpty" style="font-size:12px;margin:6px 0 0">Not enough history yet - check back after using the app on a few different days.</p>
+      </div>
+
+      <div id="rptEmpty" class="card hidden"><p class="muted" style="margin:0">No expenses in this month yet.</p></div>
+    </div>
+
+    <!-- ============ APP: SUBSCRIPTIONS VIEW ============ -->
+    <div id="subsView" class="hidden">
+      <div class="topbar">
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="secondary" id="backFromSubs" style="width:auto;padding:8px 10px">←</button>
+          <h1 style="margin:0">Subscriptions/Bills</h1>
+        </div>
+        <button class="secondary" id="addSubBtn" style="width:auto;padding:8px 12px">+ Add</button>
+      </div>
+
+      <div class="totals">
+        <div class="card"><div class="muted" style="font-size:12px">Monthly total</div><div class="big" id="subsTotalMonthly">$0</div></div>
+        <div class="card"><div class="muted" style="font-size:12px">Yearly</div><div class="big" id="subsTotalYearly">$0</div></div>
+      </div>
+
+      <!-- Recurring-expense detection (README appendix open decision) -
+           hidden unless at least one candidate is found, unlike dealsCard
+           below which always shows an empty-state message; this is a
+           discovery nudge, not a summary that should always occupy space. -->
+      <div class="card hidden" id="recurringCard">
+        <div class="topbar" style="margin-bottom:6px">
+          <strong>Recurring expenses found</strong>
+        </div>
+        <p class="muted" style="font-size:12px;margin:0 0 8px">These look like a bill based on your expense history - tap one to start tracking it here.</p>
+        <div id="recurringList"></div>
+      </div>
+
+      <!-- Savings / discount discovery (README §3.7 F6) -->
+      <div class="card" id="dealsCard">
+        <div class="topbar" style="margin-bottom:6px">
+          <strong>Savings found</strong>
+          <span class="muted" style="font-size:12px" id="dealsTotal"></span>
+        </div>
+        <div id="dealsList"><p class="muted" style="font-size:13px">Add subscriptions to see cheaper eligible plans.</p></div>
+      </div>
+
+      <!-- Live-found deals (F6 stretch) - hidden unless DEAL_FINDINGS_ENABLED
+           is set in config.js. Separate trust tier from the curated card
+           above: machine-found, unverified, never blended in. -->
+      <div class="card hidden" id="dealFindingsCard">
+        <div class="topbar" style="margin-bottom:6px">
+          <strong>Found online</strong>
+          <span class="muted" style="font-size:12px">unverified - tap a link to check the source</span>
+        </div>
+        <div id="dealFindingsList"></div>
+      </div>
+
+      <!-- Add / edit form (hidden until used) -->
+      <div class="card hidden" id="subForm">
+        <div class="topbar" style="margin-bottom:6px"><strong id="subFormTitle">New subscription/bill</strong></div>
+        <label>Service name</label>
+        <input id="sName" placeholder="Spotify" />
+        <!-- Free text with suggestions, not a fixed dropdown - same pattern
+             as acctBank below: pick a common category or type any label of
+             your own. -->
+        <label>Category</label>
+        <input id="sCategory" placeholder="Streaming & Media" list="subCategorySuggestions" autocomplete="off" />
+        <datalist id="subCategorySuggestions"></datalist>
+        <div class="row">
+          <div><label>Amount</label><input id="sAmount" type="number" step="0.01" inputmode="decimal" /></div>
+          <div><label>Billing cycle</label>
+            <select id="sCycle"><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option><option value="semiannual">Semiannual</option><option value="annual">Annual</option><option value="other">Other</option></select>
+          </div>
+        </div>
+        <div class="row">
+          <div><label>Next renewal</label><input id="sRenewal" type="date" /></div>
+          <div><label>Account</label><select id="sAccount"></select></div>
+        </div>
+        <label><input type="checkbox" id="sActive" style="width:auto;margin-right:8px" checked />Active</label>
+        <!-- Just the flag for now - no "what could I cut" view reads it yet. -->
+        <label><input type="checkbox" id="sEssential" style="width:auto;margin-right:8px" />Essential (bill you need, not a discretionary subscription)</label>
+        <label>Notes</label>
+        <input id="sNotes" placeholder="e.g. shared family plan" />
+        <div style="height:12px"></div>
+        <!-- Logs today's charge as a real expense against the linked account
+             (same asset/liability effect as any other expense) and rolls
+             next_renewal forward one cycle - see markPaidBtn in app.js. -->
+        <button class="secondary hidden" id="markPaidBtn">Mark as paid - log this charge</button>
+        <div style="height:8px"></div>
+        <div class="row">
+          <button id="saveSubBtn">Save</button>
+          <button class="secondary" id="cancelSubBtn">Cancel</button>
+        </div>
+        <div style="height:8px"></div>
+        <button class="secondary hidden" id="deleteSubBtn" style="color:var(--err)">Delete subscription/bill</button>
+      </div>
+
+      <div class="card">
+        <strong>Upcoming renewals (30 days)</strong>
+        <div id="subUpcoming" style="margin-top:8px"><p class="muted">None in the next 30 days.</p></div>
+      </div>
+
+      <div class="card">
+        <strong>All subscriptions/bills</strong>
+        <p class="muted" style="font-size:12px;margin:4px 0 0">Tap one to edit.</p>
+        <div id="subList" style="margin-top:8px"><p class="muted">Loading…</p></div>
+        <button class="secondary" id="addSubBtnBottom" style="width:auto;padding:6px 10px;font-size:12px;margin-top:10px">+ Add</button>
+      </div>
+    </div>
+
+    <!-- ============ APP: INVESTMENTS VIEW ============ -->
+    <div id="investView" class="hidden">
+      <div class="topbar">
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="secondary" id="backFromInvest" style="width:auto;padding:8px 10px">←</button>
+          <h1 style="margin:0">Investments</h1>
+        </div>
+      </div>
+
+      <div class="totals">
+        <div class="card"><div class="muted" style="font-size:12px">Total value</div><div class="big" id="investTotalValue">$0</div></div>
+        <div class="card"><div class="muted" style="font-size:12px">Total gain/loss</div><div class="big" id="investTotalGainLoss">$0</div></div>
+      </div>
+      <div class="totals">
+        <div class="card"><div class="muted" style="font-size:12px">Today's change</div><div class="big" id="investTodayChange">$0</div></div>
+        <div class="card"><div class="muted" style="font-size:12px">Cost basis</div><div class="big" id="investTotalCostBasis">$0</div></div>
+      </div>
+      <p class="muted" id="investTodayChangeEmpty" style="font-size:12px;margin:-8px 0 14px">Today's change needs at least 2 days of price history - check back once tools/price-agent.js has run more than once.</p>
+
+      <!-- One snapshot per calendar day the app was actually opened
+           (snapshotPortfolioIfNeeded, app.js) - same reasoning as the
+           Reports page's net worth trend (no cron/server for a static
+           PWA). A day the app wasn't opened just has no row. -->
+      <div class="card">
+        <strong>Value over time</strong>
+        <div class="chartbox short"><canvas id="investTrendChart"></canvas></div>
+        <p class="muted" id="investTrendEmpty" style="font-size:12px;margin:6px 0 0">Not enough history yet - check back after using the app on a few different days.</p>
+      </div>
+
+      <!-- Every asset in INVESTMENT_ASSET_TYPES (app.js) - a ticker-tracked
+           holding shows live price/gain-loss/day-change math; a symbol-less
+           one (a blended 401(k), say) just shows its value. Explanation
+           text (if tools/price-agent.js found one) shows under the row. -->
+      <div class="card">
+        <strong>Holdings</strong>
+        <div id="investHoldingsList" style="margin-top:8px"><p class="muted" style="font-size:13px">No investments added yet - add one from the Assets card on the Log page (Brokerage, IRA, 401(k), crypto, ...).</p></div>
+      </div>
+
+      <!-- A calculator, not a recommendation - risk label and targets are
+           only ever shown back to you as numbers. Nothing here ever
+           suggests what to buy. -->
+      <div class="card">
+        <strong>Target allocation</strong>
+        <p class="muted" style="font-size:12px;margin:4px 0 8px">Set your own target mix and see how far off you are - this never picks investments for you.</p>
+        <label>Risk label (for your own reference only)</label>
+        <select id="investRiskLabel">
+          <option value="">Not set</option>
+          <option value="conservative">Conservative</option>
+          <option value="moderate">Moderate</option>
+          <option value="aggressive">Aggressive</option>
+        </select>
+        <div id="investTargetsList" style="margin-top:12px"><p class="muted" style="font-size:13px">No targets set yet.</p></div>
+        <div class="row" style="margin-top:10px">
+          <input id="investTargetBucket" list="investBucketSuggestions" placeholder="Bucket (Stocks, Bonds...)" style="flex:1" />
+          <input id="investTargetPercent" type="number" step="0.1" min="0" max="100" inputmode="decimal" placeholder="Target %" style="flex:1" />
+          <button id="saveInvestTargetBtn" style="width:auto;padding:6px 12px;font-size:12px">Set</button>
+        </div>
+      </div>
+
+      <datalist id="investBucketSuggestions">
+        <option value="Stocks"></option>
+        <option value="Bonds"></option>
+        <option value="Cash"></option>
+        <option value="Crypto"></option>
+        <option value="Real Estate"></option>
+      </datalist>
+    </div>
+
+  </div>
+
+  <!-- ============ CONFIRM MODAL ============ -->
+  <!-- Generic yes/no dialog - replaces window.confirm() for destructive
+       actions (starting with account deletion) so the message and buttons
+       match the rest of the app's look instead of the browser's native
+       confirm() box. See confirmModal() in app.js. -->
+  <div id="confirmModal" class="modal hidden">
+    <div class="sheet">
+      <strong id="confirmModalTitle">Are you sure?</strong>
+      <p id="confirmModalMsg" class="muted" style="font-size:14px;margin:10px 0 18px"></p>
+      <div class="row">
+        <button class="secondary" id="confirmModalCancel">Cancel</button>
+        <button class="secondary" id="confirmModalOk" style="color:var(--err);border-color:var(--err)">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ EDIT MODAL ============ -->
+  <div id="editModal" class="modal hidden">
+    <div class="sheet">
+      <div class="topbar"><strong>Edit expense</strong><button class="secondary" id="editClose" style="width:auto;padding:6px 12px">Close</button></div>
+      <!-- No separate Payment field - same as quick-add, payment type is
+           derived from whichever account is selected below (app.js). -->
+      <label>Amount</label>
+      <input id="eAmount" type="number" step="0.01" inputmode="decimal" />
+      <!-- Amount/Account/Category/Date are all required (see editSave,
+           app.js) - Description is the only optional field here. -->
+      <label>Description / merchant (optional)</label>
+      <input id="eDesc" />
+      <div class="row">
+        <div><label>Category</label><select id="eCategory"></select></div>
+        <div><label>Account</label><select id="eAccount"></select></div>
+      </div>
+      <label>Date</label>
+      <input id="eDate" type="date" />
+      <label style="margin-top:12px"><input type="checkbox" id="eLearn" style="width:auto;margin-right:8px" checked />Remember this category for similar merchants</label>
+      <div style="height:14px"></div>
+      <div class="row">
+        <button id="editSave">Save changes</button>
+        <button class="secondary" id="editDelete" style="color:var(--err)">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ LIABILITY BALANCE MODAL ============ -->
+  <!-- "Paying balance" is a transfer (asset down, liability down), never
+       a new expense - always available. "Owed" (direct set + add-a-
+       charge) only shows for a liability with NO linked credit account -
+       one that credit-account-linked never shows tabs at all, just Pay
+       directly, since its owed amount can only move through actual
+       credit expenses (quick-add/edit, account type credit) from here on.
+       A standalone Loan/Mortgage/Other liability has no purchase trail to
+       reconcile against, so it keeps manual Owed editing - see
+       openDebtBalanceForm (app.js) for the linked/standalone branch. -->
+  <div id="debtBalanceForm" class="modal hidden">
+    <div class="sheet">
+      <div class="topbar"><strong><span id="debtBalanceLabel"></span></strong><button class="secondary" id="debtBalanceClose" style="width:auto;padding:6px 12px">✕</button></div>
+      <p class="muted" style="font-size:12px;margin:0 0 8px">Owes <strong id="debtBalanceCurrent">$0</strong></p>
+      <div class="row hidden" id="debtTabRow" style="margin-bottom:12px">
+        <button class="secondary" id="debtTabOwed" style="padding:8px 0;font-size:13px">Owed</button>
+        <button class="secondary" id="debtTabPaying" style="padding:8px 0;font-size:13px">Paying balance</button>
+      </div>
+      <div id="debtOwedMode" class="hidden">
+        <!-- Direct set, for fixing a wrong balance (typo, missed charge) -
+             separate from "Amount to add" below, which is for a new charge. -->
+        <label>Set exact amount owed</label>
+        <input id="debtOwedSet" type="number" step="0.01" inputmode="decimal" />
+        <div style="height:8px"></div>
+        <button id="debtOwedSetConfirm">Save amount owed</button>
+
+        <div class="muted" style="font-size:12px;margin:12px 0 6px">Or add a charge</div>
+        <label>Amount to add</label>
+        <input id="debtOwedAmount" type="number" step="0.01" inputmode="decimal" />
+        <div style="height:12px"></div>
+        <button id="debtOwedConfirm">Add to owed</button>
+      </div>
+      <div id="debtPayingMode">
+        <!-- Account-linked assets only - paying a liability down is a
+             transaction and every transaction links to a specific account,
+             so a standalone asset (Investment, Property, a manually-added
+             retirement account) with no linked account can't be picked
+             here. See loadAssets() (app.js). -->
+        <label>From account</label>
+        <select id="payFromAsset"></select>
+        <label>Amount</label>
+        <input id="payAmount" type="number" step="0.01" inputmode="decimal" />
+        <div style="height:12px"></div>
+        <button id="payConfirmBtn">Pay</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ CSV IMPORT MODAL ============ -->
+  <!-- Migrate expense history from another platform. Runs entirely
+       client-side (PapaParse parses the file in the browser, csvImport.js
+       normalizes rows) - nothing is uploaded anywhere except the final,
+       user-confirmed rows via the same RLS-scoped insert every other
+       expense write already uses. Deliberately does NOT apply asset/
+       liability deltas (see app.js) - these are historical expenses that
+       already happened, so the linked account's current balance already
+       reflects them; replaying them through that pipeline would
+       double-subtract and corrupt it. -->
+  <div id="csvImportModal" class="modal hidden">
+    <div class="sheet">
+      <div class="topbar"><strong>Import CSV</strong><button class="secondary" id="csvImportClose" style="width:auto;padding:6px 12px">Close</button></div>
+
+      <div id="csvStep1">
+        <p class="muted" style="font-size:13px">Import expense history from another platform (bank export, Mint, YNAB, ...). Everything happens in your browser - the file itself is never uploaded anywhere.</p>
+        <p class="muted" style="font-size:12px;margin-top:8px"><strong>Imported expenses only add to your history for tracking and reports - they never change any account or liability balance.</strong> Those already reflect this spending in real life; adjust them yourself afterward if this file doesn't already match your current balance.</p>
+        <label style="margin-top:12px">CSV file (up to 5MB, ~10,000 rows)</label>
+        <input id="csvFileInput" type="file" accept=".csv,text/csv" />
+        <p class="muted" id="csvFileError" style="font-size:12px;color:var(--err);margin-top:6px"></p>
+      </div>
+
+      <div id="csvStep2" class="hidden">
+        <p class="muted" style="font-size:13px">Match each column in your file to a field. Date and Amount are required.</p>
+        <div class="row">
+          <div><label>Date column</label><select id="csvMapDate"></select></div>
+          <div><label>Amount column</label><select id="csvMapAmount"></select></div>
+        </div>
+        <div class="row">
+          <div><label>Description column (optional)</label><select id="csvMapDesc"></select></div>
+          <div><label>Category column (optional)</label><select id="csvMapCategory"></select></div>
+        </div>
+        <label style="margin-top:10px"><input type="checkbox" id="csvFlipSign" style="width:auto;margin-right:8px" />Amounts in this file are negative for money spent</label>
+        <label>Import into account</label>
+        <select id="csvAccount"></select>
+        <div style="height:10px"></div>
+        <div class="row">
+          <button id="csvStep2Next">Preview</button>
+          <button class="secondary" id="csvStep2Back">Back</button>
+        </div>
+      </div>
+
+      <div id="csvStep3" class="hidden">
+        <p class="muted" id="csvPreviewSummary" style="font-size:13px"></p>
+        <p class="muted" style="font-size:12px">Rows checked will be imported. Likely duplicates (matching an existing expense's date, amount, and description) start unchecked.</p>
+        <div id="csvPreviewList" class="scroll-list" style="margin-top:8px"></div>
+        <div style="height:10px"></div>
+        <div class="row">
+          <button id="csvImportConfirm">Import checked rows</button>
+          <button class="secondary" id="csvStep3Back">Back</button>
+        </div>
+      </div>
+
+      <div id="csvStep4" class="hidden">
+        <p id="csvImportSummary" style="font-size:14px"></p>
+        <div class="row">
+          <button class="secondary" id="csvUndoImportBtn" style="color:var(--err)">Undo this import</button>
+          <button id="csvImportDone">Done</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ PROFILE MODAL ============ -->
+  <div id="profileModal" class="modal hidden">
+    <div class="sheet">
+      <div class="topbar"><strong>Your profile</strong><button class="secondary" id="profileClose" style="width:auto;padding:6px 12px">Close</button></div>
+
+      <!-- Surfaced first, above the deal/financial-context fields below -
+           this is account-level, not profile data, and password sign-in
+           (see index.html's authView comment) is what keeps an installed
+           home-screen icon signed in, so it belongs where it's seen first. -->
+      <div class="muted" style="font-size:12px;margin:0 0 4px;font-weight:700">Account security</div>
+      <label>Email</label>
+      <input id="pEmail" disabled />
+      <label>New password</label>
+      <input id="pNewPassword" type="password" autocomplete="new-password" placeholder="At least 6 characters" />
+      <button class="secondary" id="setPasswordBtn">Set / change password</button>
+      <p id="passwordSetMsg" class="muted" style="margin-top:8px;font-size:12px"></p>
+      <div style="height:14px"></div>
+
+      <p class="muted" style="font-size:12px;margin:0 0 8px">Used to match you to better subscription deals and to give sharper answers in Reports' Q&A. Only you can see this.</p>
+      <label>Display name</label>
+      <input id="pName" placeholder="Your name" />
+      <label>Status</label>
+      <select id="pStatus">
+        <option value="working">Working</option>
+        <option value="student">Student</option>
+        <option value="other">Other</option>
+      </select>
+      <div id="pStudentFields" class="hidden">
+        <div class="row">
+          <div><label>School</label><input id="pSchool" placeholder="e.g. NYU" /></div>
+          <div><label>Graduation year</label><input id="pGradYear" type="number" inputmode="numeric" placeholder="2027" /></div>
+        </div>
+      </div>
+
+      <!-- Deal-eligibility fields - feed discounts.js's isEligible(), the
+           same way `status === 'student'` already does, so a real
+           military/first-responder/senior catalog entry (subscription_
+           catalog.plan_type has no fixed enum - it's hand-seeded reference
+           data) matches automatically once one exists. -->
+      <div class="muted" style="font-size:12px;margin:16px 0 4px;font-weight:700">Deal eligibility</div>
+      <label style="margin-top:6px"><input type="checkbox" id="pMilitary" style="width:auto;margin-right:8px" />Military or veteran</label>
+      <label style="margin-top:6px"><input type="checkbox" id="pFirstResponder" style="width:auto;margin-right:8px" />First responder or healthcare worker</label>
+      <label>Birth year</label>
+      <input id="pBirthYear" type="number" inputmode="numeric" placeholder="1995" />
+      <div class="row">
+        <div><label>Employer</label><input id="pEmployer" placeholder="e.g. Google" /></div>
+        <div><label>Occupation</label><input id="pOccupation" placeholder="e.g. Teacher" /></div>
+      </div>
+
+      <!-- Financial-context fields - not used for deal matching, folded
+           into the Gemma Q&A context instead (insights.js buildQaContext)
+           so a question like "should I pay down debt or save?" has
+           something real to reason about. -->
+      <div class="muted" style="font-size:12px;margin:16px 0 4px;font-weight:700">Financial context</div>
+      <div class="row">
+        <div><label>Housing</label>
+          <select id="pHousing">
+            <option value="">Not set</option>
+            <option value="own">Own</option>
+            <option value="rent">Rent</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+        <div><label>Employment</label>
+          <select id="pEmployment">
+            <option value="">Not set</option>
+            <option value="employed">Employed</option>
+            <option value="self_employed">Self-employed</option>
+            <option value="retired">Retired</option>
+            <option value="unemployed">Unemployed</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div><label>Household size</label><input id="pHouseholdSize" type="number" inputmode="numeric" placeholder="2" /></div>
+        <div><label>Dependents</label><input id="pDependents" type="number" inputmode="numeric" placeholder="0" /></div>
+      </div>
+      <label>Financial goals</label>
+      <input id="pGoals" placeholder="e.g. paying down credit card debt" />
+
+      <label>Notes</label>
+      <input id="pNotes" placeholder="anything else that helps" />
+      <div style="height:14px"></div>
+      <button id="profileSave">Save profile</button>
+      <div style="height:8px"></div>
+      <!-- Every table this profile row's own data lives in - not the
+           shared reference tables (subscription_catalog, deal_findings,
+           asset_price_findings, service_domains), which aren't this
+           user's data to begin with. -->
+      <button class="secondary" id="downloadDataBtn">Download all my data</button>
+    </div>
+  </div>
+
+  <!-- Bottom nav -->
+  <nav id="nav" class="nav hidden">
+    <button id="navLog" class="active">Log</button>
+    <button id="navSubs">Subscriptions/Bills</button>
+    <button id="navInvest">Investments</button>
+    <button id="navReports">Reports</button>
+  </nav>
+
+  <div id="toast" class="toast"></div>
+
+  <!-- Supabase + Chart.js + PapaParse from CDN (no build step). PapaParse
+       parses CSV imports (Log page) - correctly handles quoted fields with
+       embedded commas/quotes, which a hand-rolled split(',') parser would
+       silently misparse (a real correctness/data-integrity risk for
+       financial data, confirmed by testing before adopting it). -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5/papaparse.min.js"></script>
+  <script src="config.js"></script>
+  <script type="module" src="app.js"></script>
+  <script>
+    if ("serviceWorker" in navigator) {
+      let waitingWorker = null;
+
+      navigator.serviceWorker.register("sw.js").then((reg) => {
+        reg.update();
+        setInterval(() => reg.update(), 60 * 1000);
+
+        reg.addEventListener("updatefound", () => {
+          const nw = reg.installing;
+          nw.addEventListener("statechange", () => {
+            if (nw.state === "installed" && navigator.serviceWorker.controller) {
+              // A new version is ready but not yet active - ask, don't force.
+              waitingWorker = nw;
+              showUpdateToast();
+            }
+          });
+        });
+      }).catch(() => {});
+
+      // Only reload once the user has actually tapped the toast below - a
+      // controllerchange can also fire on the very first-ever page load
+      // (going from no service worker to one), and reloading unconditionally
+      // there (or on any background update) meant the page could silently
+      // reload itself mid-interaction - e.g. wiping out an in-progress
+      // Pay-liability form - with no visible cause. "Ask, don't force"
+      // (see the comment below) only holds if the reload itself waits too.
+      let reloading = false;
+      let updateApproved = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (reloading || !updateApproved) return;
+        reloading = true;
+        window.location.reload();
+      });
+
+      function showUpdateToast() {
+        const t = document.getElementById("toast");
+        t.textContent = "Update available - tap to refresh";
+        t.style.cursor = "pointer";
+        t.classList.add("show");
+        t.onclick = () => {
+          t.classList.remove("show");
+          t.onclick = null;
+          updateApproved = true;
+          if (waitingWorker) waitingWorker.postMessage("skipWaiting");
+        };
+        // Don't auto-dismiss like the normal toast() in app.js - it should
+        // stay up until tapped or until the next reload.
+      }
+    }
+  </script>
+</body>
+</html>

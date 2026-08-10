@@ -1,0 +1,6 @@
+.DS_Store
+.Rhistory
+node_modules/
+app/config.js
+tools/.env.deal-agent
+tools/searxng/searxng-config/

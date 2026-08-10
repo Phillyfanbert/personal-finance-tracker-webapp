@@ -1,0 +1,13 @@
+-- HELOC draw-vs-repayment-period modeling.
+-- Only meaningful for type = 'heloc', no CHECK enforcing that (same
+-- looseness every other type-specific optional field in this app already
+-- has - maturity_date, purchase_price, etc.).
+--
+-- Deliberately just a date, not a phase enum or a payment-schedule model:
+-- the phase itself is always derived (today vs draw_period_end), and the
+-- balance itself still only ever moves through real, dated expenses/
+-- payments against the linked account - this column, and interest_rate/
+-- minimum_payment which already existed, are read-only inputs to a
+-- projection, never a path to directly set what's owed. That hard rule
+-- doesn't bend for this feature.
+alter table liabilities add column if not exists draw_period_end date;
