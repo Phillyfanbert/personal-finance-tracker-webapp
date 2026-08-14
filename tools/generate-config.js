@@ -27,6 +27,8 @@ const contents = `window.APP_CONFIG = {
   SUPABASE_ANON_KEY: ${JSON.stringify(SUPABASE_ANON_KEY)},
   GEMMA_ENDPOINT: ${JSON.stringify(process.env.GEMMA_ENDPOINT || "")},
   GEMMA_MODEL: ${JSON.stringify(process.env.GEMMA_MODEL || "gemma")},
+  GEMMA_EMBED_MODEL: ${JSON.stringify(process.env.GEMMA_EMBED_MODEL || "nomic-embed-text")},
+  GEMMA_AUTH_KEY: ${JSON.stringify(process.env.GEMMA_AUTH_KEY || "")},
   // Both previously missing here entirely - the production deploy could
   // never show F6 deal findings regardless of what a local config.js had,
   // since this generator (the actual build step, per this file's own

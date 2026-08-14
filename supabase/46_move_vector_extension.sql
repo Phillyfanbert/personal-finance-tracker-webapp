@@ -1,0 +1,15 @@
+-- Migration 45 installed the vector extension with a bare
+-- `create extension if not exists vector;` (no schema clause), which
+-- landed it in `public` - unlike this project's already-installed
+-- extensions (pgcrypto, uuid-ossp), which both live in a dedicated
+-- `extensions` schema. Confirmed via `list_extensions`/`get_advisors`
+-- right after applying 45 that this triggered a real Supabase linter WARN
+-- (`extension_in_public`), not a hypothetical concern.
+--
+-- Safe to move after the fact: `vector` is relocatable (confirmed via
+-- `pg_extension.extrelocatable = true` before running this), and
+-- match_expense_embeddings()'s pinned `search_path = public, extensions`
+-- (see 45_expense_embeddings.sql) already covers whichever schema the
+-- type actually lives in, so this needed no function changes - verified
+-- live with a synthetic insert + RPC call immediately after the move.
+alter extension vector set schema extensions;

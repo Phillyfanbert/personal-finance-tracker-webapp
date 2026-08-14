@@ -22,7 +22,7 @@
     body {
       margin: 0; font-family: -apple-system, system-ui, sans-serif;
       background: var(--bg); color: var(--text);
-      padding: env(safe-area-inset-top) 0 calc(72px + env(safe-area-inset-bottom));
+      padding: calc(72px + env(safe-area-inset-top)) 0 env(safe-area-inset-bottom);
     }
     .wrap { max-width: 560px; margin: 0 auto; padding: 16px; }
     h1 { font-size: 20px; margin: 8px 0 16px; }
@@ -33,6 +33,11 @@
       border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
     }
     input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); }
+    /* Applied/removed live by app.js (updateRequiredFieldHighlighting) on
+       Quick Add's Amount/Account/Category/Date - a still-empty required
+       field, not a submitted-and-rejected one, so this reflects current
+       state rather than only flashing after a failed Save. */
+    input.field-required, select.field-required { border-color: var(--err); }
     label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
     button { background: var(--accent-2); border: none; color: #002233; font-weight: 700; cursor: pointer; }
     button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); font-weight: 500; }
@@ -51,7 +56,7 @@
       padding: 12px 0; border-bottom: 1px solid var(--border); gap: 10px; cursor: pointer; }
     .exp:last-child { border-bottom: none; }
     /* Caps a long expense list instead of letting it push everything below
-       it down the page - Recent Transactions (Log) and the Reports month log. */
+       it down the page - Recent History (Log) and the Reports month log. */
     .scroll-list { max-height: 360px; overflow-y: auto; }
     .exp .meta { font-size: 13px; color: var(--muted); }
     .exp .amt { font-weight: 700; white-space: nowrap; }
@@ -74,19 +79,52 @@
     .totals .big { font-size: 22px; font-weight: 800; }
     .chartbox { position: relative; height: 240px; }
     .chartbox.short { height: 200px; }
-    /* Bottom nav */
-    .nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
-      display: flex; background: var(--panel); border-top: 1px solid var(--border);
-      padding-bottom: env(safe-area-inset-bottom); }
+    .chartbox.tiny { height: 110px; }
+    /* Top nav */
+    .nav { position: fixed; left: 0; right: 0; top: 0; z-index: 40;
+      display: flex; background: var(--panel); border-bottom: 1px solid var(--border);
+      padding-top: env(safe-area-inset-top); }
     .nav button { flex: 1; background: transparent; border: none; color: var(--muted);
-      font-weight: 600; padding: 16px 0; border-radius: 0; }
-    .nav button.active { color: var(--accent); }
+      font-weight: 600; padding: 16px 0; border-radius: 0;
+      transition: background-color .15s, color .15s, text-shadow .15s; }
+    /* Adjacent-sibling selector so only the borders BETWEEN buttons show -
+       a plain border on every button would double up at each shared edge
+       and add an unwanted one on the far left/right too. Muted-tinted
+       rgba rather than --border - --border reads almost invisibly close
+       to --panel's own background at this small a swatch. */
+    .nav button + button { border-left: 1.5px solid rgba(148, 163, 184, .45); }
+    .nav button.active { color: var(--accent); background: rgba(56, 189, 248, .14);
+      text-shadow: 0 0 12px rgba(56, 189, 248, .6); }
     /* Modal */
     .modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 70;
       display: flex; align-items: flex-end; justify-content: center; }
     .modal .sheet { background: var(--panel); width: 100%; max-width: 560px;
       border-radius: 16px 16px 0 0; border: 1px solid var(--border); padding: 18px;
       max-height: 90vh; overflow-y: auto; }
+    /* Help ("?") button, one per view topbar - small and circular so it
+       reads as a secondary/reference action, not competing with the
+       page's real buttons (Profile, + Add, ...) for attention. */
+    .help-btn { width: 30px; height: 30px; flex: none; padding: 0;
+      border-radius: 50%; background: var(--panel-2); border: 1px solid var(--border);
+      color: var(--text); font-weight: 700; font-size: 15px; cursor: pointer; }
+    /* #helpModal's sheet is wider and taller than the other modals (real,
+       long documentation, not a short confirm/pick prompt) - a dedicated
+       class instead of widening .modal .sheet globally, which would also
+       stretch confirmModal/archivedAcctModal/csvImportModal beyond what
+       their own short content needs. */
+    .help-sheet { max-width: 720px; max-height: 92vh; }
+    .help-pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 16px; }
+    .help-pill { width: auto; padding: 6px 12px; font-size: 12px; border-radius: 999px;
+      background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); cursor: pointer; }
+    .help-pill.active { color: var(--text); border-color: var(--accent); }
+    .help-topic { margin-bottom: 18px; }
+    .help-topic:last-child { margin-bottom: 0; }
+    .help-topic h3 { font-size: 15px; margin: 0 0 6px; }
+    .help-topic p { font-size: 13px; color: var(--muted); margin: 0 0 8px; line-height: 1.5; }
+    .help-topic p:last-child { margin-bottom: 0; }
+    .help-diagram { background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px; margin: 4px 0 18px; }
+    .help-diagram svg { display: block; width: 100%; height: auto; }
   </style>
 </head>
 <body>
@@ -125,7 +163,10 @@
            the buttons on narrow screens rather than fighting them for
            space in a single row. -->
       <div class="topbar" style="flex-wrap:wrap;gap:8px">
-        <h1 style="margin:0;font-size:17px">Personal Finance Tracker</h1>
+        <div style="display:flex;align-items:center;gap:10px">
+          <h1 style="margin:0;font-size:17px">Personal Finance Tracker</h1>
+          <button class="help-btn" id="helpLogBtn" title="Help">?</button>
+        </div>
         <div style="display:flex;gap:8px">
           <button class="secondary" id="profileBtn" style="width:auto;padding:8px 12px">Profile</button>
           <button class="secondary" id="signOutBtn" style="width:auto;padding:8px 12px">Sign out</button>
@@ -178,7 +219,7 @@
 
       <!-- Expense list -->
       <div class="card">
-        <strong>Recent Transactions</strong>
+        <strong>Recent History</strong>
         <!-- Four independent filters, all AND-ed together (see
              filteredTransactions in app.js). A label above each one names
              what it filters by, so the option text itself can just say
@@ -245,6 +286,26 @@
         <div id="expList" class="scroll-list" style="margin-top:8px"><p class="muted">Loading…</p></div>
       </div>
 
+      <!-- An ongoing monthly limit per category, not per-month-varying - set
+           once, applies every month until changed. Lives on the Log page,
+           beside the spending it constrains, so that Reports stays purely
+           analytics of data recorded elsewhere; setting a budget is an input,
+           not a report. Always scoped to the CURRENT month here, unlike when
+           it sat on Reports and followed that page's month selector - a
+           limit you are deciding right now is about the month you are in.
+           renderBudgets() is called from loadExpenses (app.js), not from
+           renderReports, for the same reason. -->
+      <div class="card">
+        <strong>Budgets</strong>
+        <p class="muted" style="font-size:12px;margin:4px 0 0">Monthly limit per category, for the current month.</p>
+        <div id="budgetsList" style="margin-top:8px"><p class="muted" style="font-size:13px">No budgets set yet.</p></div>
+        <div class="row" style="margin-top:10px">
+          <select id="budgetCategory" style="flex:1"></select>
+          <input id="budgetLimit" type="number" step="0.01" inputmode="decimal" placeholder="Monthly limit" style="flex:1" />
+          <button id="saveBudgetBtn" style="width:auto;padding:6px 12px;font-size:12px">Set</button>
+        </div>
+      </div>
+
       <!-- Net worth overview -->
       <div class="card" id="netWorthCard">
         <div class="muted" style="font-size:12px">Net worth</div>
@@ -263,6 +324,12 @@
         <div id="acctList" class="acct-circles">
           <p class="muted" style="font-size:13px">No accounts yet.</p>
         </div>
+        <!-- Archived accounts are removed from the circles above entirely
+             rather than dimmed in place. A closed account keeps its history
+             forever, so over time the dimmed ones crowd out the accounts
+             actually in use. This link is the only way back to them and is
+             hidden outright when there are none (renderAccountsList). -->
+        <div id="archivedAcctToggle" class="muted hidden" style="font-size:12px;cursor:pointer;text-decoration:underline;margin-top:8px"></div>
         <div id="acctForm" class="hidden" style="margin-top:10px">
           <!-- No separate "account name" field - it was always just the
                type in practice (Checking, Savings, Credit), so the name is
@@ -399,13 +466,14 @@
                holding has no depreciation date/rate to pair it with, just
                a total amount originally paid, used for the Investments
                tab's gain/loss math. Bucket feeds that tab's target-
-               allocation calculator, same free-text-plus-suggestions
-               pattern accounts.bank_name/subscriptions.category use. -->
+               allocation calculator - a fixed <select>, not free text
+               (INVESTMENT_BUCKETS, app.js), so a typo can't silently
+               create a second bucket that a target never matches. -->
           <div id="assetInvestmentSection" class="hidden" style="margin-top:8px">
             <label>Cost basis - total paid (optional)</label>
             <input id="assetCostBasis" type="number" step="0.01" inputmode="decimal" placeholder="What you originally paid, in total" />
             <label>Allocation bucket (optional)</label>
-            <input id="assetInvestBucket" list="investBucketSuggestions" placeholder="Stocks, Bonds, Cash..." />
+            <select id="assetInvestBucket"></select>
           </div>
 
           <div style="height:8px"></div>
@@ -416,10 +484,10 @@
         </div>
       </div>
 
-      <!-- Live asset prices - hidden unless PRICE_FINDINGS_ENABLED is set
-           in config.js. Same trust tier as F6's "Found online" card below:
-           machine-found, unverified, applying a price is an explicit tap,
-           never automatic. -->
+      <!-- Live asset prices - hidden unless
+           PRICE_FINDINGS_ENABLED is set in config.js. Same trust tier as
+           F6's "Found online" card below: machine-found, unverified,
+           applying a price is an explicit tap, never automatic. -->
       <div class="card hidden" id="assetPriceFindingsCard">
         <div class="topbar" style="margin-bottom:6px">
           <strong>Live asset prices</strong>
@@ -500,6 +568,34 @@
           </div>
           <label>Due date (optional)</label>
           <input id="debtDetailsDue" type="date" />
+          <!-- Only for a real revolving limit (CREDIT_LIMIT_LIABILITY_TYPES,
+               app.js) - a HELOC/line of credit/regular card has one, a
+               charge card by definition doesn't ("no preset spending
+               limit"), and a loan's original amount isn't a limit you
+               utilize a percentage of. Powers the utilization line shown
+               on the Liabilities card once both this and a balance exist. -->
+          <div id="debtDetailsLimitSection" class="hidden">
+            <label>Credit limit (optional)</label>
+            <input id="debtDetailsLimit" type="number" step="0.01" inputmode="decimal" placeholder="e.g. 5000" />
+          </div>
+          <!-- Credit-account-only (openDebtDetailsForm, app.js). Interest on
+               a card is decided by the grace period, not by lateness: pay
+               the statement balance in full by the due date and no interest
+               is charged; carry any of it and interest accrues even if you
+               paid the minimum on time. That needs the cycle days plus the
+               statement balance to judge, which is what these fields are
+               for - see creditCycle.js. -->
+          <div id="debtDetailsCycleSection" class="hidden" style="margin-top:8px">
+            <div class="row">
+              <div><label>Statement closes (day)</label><input id="debtDetailsStatementDay" type="number" min="1" max="31" step="1" inputmode="numeric" placeholder="e.g. 5" /></div>
+              <div><label>Payment due (day)</label><input id="debtDetailsDueDay" type="number" min="1" max="31" step="1" inputmode="numeric" placeholder="e.g. 2" /></div>
+            </div>
+            <div class="row">
+              <div><label>Statement balance</label><input id="debtDetailsStatementBalance" type="number" step="0.01" inputmode="decimal" placeholder="From your latest statement" /></div>
+              <div><label>Statement date</label><input id="debtDetailsStatementDate" type="date" /></div>
+            </div>
+            <p class="muted" id="debtDetailsCycleInfo" style="font-size:12px;margin-top:6px"></p>
+          </div>
           <!-- HELOC-only (openDebtDetailsForm, app.js). -->
           <div id="debtDetailsDrawSection" class="hidden" style="margin-top:8px">
             <label>Draw period ends (optional)</label>
@@ -521,6 +617,7 @@
         <div style="display:flex;align-items:center;gap:10px">
           <button class="secondary" id="backFromReports" style="width:auto;padding:8px 10px">←</button>
           <h1 style="margin:0">Reports</h1>
+          <button class="help-btn" id="helpReportsBtn" title="Help">?</button>
         </div>
         <select id="monthSel" style="width:auto"></select>
       </div>
@@ -548,7 +645,7 @@
       </div>
 
       <!-- Every expense in the selected month - subscriptions, credit, and
-           debit alike - same row style as the Log page's Recent Transactions,
+           debit alike - same row style as the Log page's Recent History,
            tap to edit. Deliberately expenses only, unlike the Log page's list
            (no account activity) - this card is about spending for the month,
            not every balance change. Scrollable so a busy month doesn't push
@@ -568,21 +665,6 @@
       <div class="card">
         <strong>By category</strong>
         <div class="chartbox"><canvas id="catChart"></canvas></div>
-      </div>
-
-      <!-- An ongoing monthly limit per category, not per-month-varying -
-           set once, applies every month until changed. Scoped to the
-           month selector above, unlike the account-history/net-worth-
-           trend charts, since "over/under budget" is inherently about a
-           specific month's actual spend. -->
-      <div class="card">
-        <strong>Budgets</strong>
-        <div id="budgetsList" style="margin-top:8px"><p class="muted" style="font-size:13px">No budgets set yet.</p></div>
-        <div class="row" style="margin-top:10px">
-          <select id="budgetCategory" style="flex:1"></select>
-          <input id="budgetLimit" type="number" step="0.01" inputmode="decimal" placeholder="Monthly limit" style="flex:1" />
-          <button id="saveBudgetBtn" style="width:auto;padding:6px 12px;font-size:12px">Set</button>
-        </div>
       </div>
 
       <div class="card">
@@ -635,6 +717,7 @@
         <div style="display:flex;align-items:center;gap:10px">
           <button class="secondary" id="backFromSubs" style="width:auto;padding:8px 10px">←</button>
           <h1 style="margin:0">Subscriptions/Bills</h1>
+          <button class="help-btn" id="helpSubsBtn" title="Help">?</button>
         </div>
         <button class="secondary" id="addSubBtn" style="width:auto;padding:8px 12px">+ Add</button>
       </div>
@@ -646,8 +729,9 @@
 
       <!-- Recurring-expense detection (README appendix open decision) -
            hidden unless at least one candidate is found, unlike dealsCard
-           below which always shows an empty-state message; this is a
-           discovery nudge, not a summary that should always occupy space. -->
+           below which always shows an
+           empty-state message; this is a discovery nudge, not a summary
+           that should always occupy space. -->
       <div class="card hidden" id="recurringCard">
         <div class="topbar" style="margin-bottom:6px">
           <strong>Recurring expenses found</strong>
@@ -665,9 +749,9 @@
         <div id="dealsList"><p class="muted" style="font-size:13px">Add subscriptions to see cheaper eligible plans.</p></div>
       </div>
 
-      <!-- Live-found deals (F6 stretch) - hidden unless DEAL_FINDINGS_ENABLED
-           is set in config.js. Separate trust tier from the curated card
-           above: machine-found, unverified, never blended in. -->
+      <!-- Live-found deals (F6 stretch) - hidden
+           unless DEAL_FINDINGS_ENABLED is set in config.js. Separate trust tier
+           from the curated card above: machine-found, unverified, never blended in. -->
       <div class="card hidden" id="dealFindingsCard">
         <div class="topbar" style="margin-bottom:6px">
           <strong>Found online</strong>
@@ -676,7 +760,25 @@
         <div id="dealFindingsList"></div>
       </div>
 
-      <!-- Add / edit form (hidden until used) -->
+      <div class="card">
+        <strong>Upcoming renewals (30 days)</strong>
+        <div id="subUpcoming" style="margin-top:8px"><p class="muted">None in the next 30 days.</p></div>
+      </div>
+
+      <div class="card">
+        <strong>All subscriptions/bills</strong>
+        <p class="muted" style="font-size:12px;margin:4px 0 0">Tap one to edit.</p>
+        <div id="subList" style="margin-top:8px"><p class="muted">Loading…</p></div>
+        <button class="secondary" id="addSubBtnBottom" style="width:auto;padding:6px 10px;font-size:12px;margin-top:10px">+ Add</button>
+      </div>
+
+      <!-- Add / edit form (hidden until used) - placed below the full list
+           rather than up near the top of the page, so both "+ Add" entry
+           points (the topbar button and this list's own button) open it
+           somewhere already in view instead of scrolling all the way back
+           up past Savings found/Found online. openSubForm's scrollIntoView
+           (app.js) already scrolls to wherever this sits in the DOM, so
+           moving it here needed no JS change. -->
       <div class="card hidden" id="subForm">
         <div class="topbar" style="margin-bottom:6px"><strong id="subFormTitle">New subscription/bill</strong></div>
         <label>Service name</label>
@@ -698,7 +800,7 @@
           <div><label>Account</label><select id="sAccount"></select></div>
         </div>
         <label><input type="checkbox" id="sActive" style="width:auto;margin-right:8px" checked />Active</label>
-        <!-- Just the flag for now - no "what could I cut" view reads it yet. -->
+        <!-- Just the flag - no "what could I cut" view reads it yet. -->
         <label><input type="checkbox" id="sEssential" style="width:auto;margin-right:8px" />Essential (bill you need, not a discretionary subscription)</label>
         <label>Notes</label>
         <input id="sNotes" placeholder="e.g. shared family plan" />
@@ -715,18 +817,6 @@
         <div style="height:8px"></div>
         <button class="secondary hidden" id="deleteSubBtn" style="color:var(--err)">Delete subscription/bill</button>
       </div>
-
-      <div class="card">
-        <strong>Upcoming renewals (30 days)</strong>
-        <div id="subUpcoming" style="margin-top:8px"><p class="muted">None in the next 30 days.</p></div>
-      </div>
-
-      <div class="card">
-        <strong>All subscriptions/bills</strong>
-        <p class="muted" style="font-size:12px;margin:4px 0 0">Tap one to edit.</p>
-        <div id="subList" style="margin-top:8px"><p class="muted">Loading…</p></div>
-        <button class="secondary" id="addSubBtnBottom" style="width:auto;padding:6px 10px;font-size:12px;margin-top:10px">+ Add</button>
-      </div>
     </div>
 
     <!-- ============ APP: INVESTMENTS VIEW ============ -->
@@ -735,7 +825,48 @@
         <div style="display:flex;align-items:center;gap:10px">
           <button class="secondary" id="backFromInvest" style="width:auto;padding:8px 10px">←</button>
           <h1 style="margin:0">Investments</h1>
+          <button class="help-btn" id="helpInvestBtn" title="Help">?</button>
         </div>
+      </div>
+
+      <!-- Market overview: a fixed set of major US indexes (S&P 500, Dow,
+           NASDAQ, Russell 2000 - app.js's MARKET_INDEXES) plus today's top
+           3 movers from a fixed large-cap watchlist (MARKET_MOVERS_
+           WATCHLIST) - both genuinely NOT tied to anything the user owns,
+           unlike every other card on this tab. Same dormant SearXNG+Gemma
+           pipeline as the rest of live pricing (tools/price-agent.js),
+           gated by the same PRICE_FINDINGS_ENABLED flag - hidden entirely
+           (not shown with an empty/placeholder state) until that's on and
+           the agent has actually written rows, since there's no manual-
+           entry fallback for either an index or a watchlist stock the way
+           there is for the user's own assets. The movers subsection hides
+           itself independently (there may be indexes but no rankable
+           movers yet, or vice versa). -->
+      <div class="card hidden" id="marketOverviewCard">
+        <strong>Market overview</strong>
+        <p class="muted" style="font-size:12px;margin:4px 0 8px">Major US indexes, updated once tools/price-agent.js has run.</p>
+        <div id="marketOverviewList"></div>
+        <div id="marketMoversSection" class="hidden" style="margin-top:14px">
+          <strong style="font-size:13px">Today's top movers</strong>
+          <p class="muted" style="font-size:12px;margin:4px 0 8px">Biggest moves (up or down) from a fixed watchlist of well-known large-cap stocks - not a scan of the whole market, and not a recommendation.</p>
+          <div id="marketMoversList"></div>
+        </div>
+      </div>
+
+      <!-- Daily health check: a short compilation of numbers already
+           computed elsewhere on this tab (today's move, gain/loss since
+           cost basis, allocation drift, contribution-limit status, live-
+           pricing coverage) via investments.js's portfolioHealthSummary -
+           deliberately not a fabricated composite score, same boundary
+           already drawn for the Liabilities card's credit-
+           utilization line. A line only appears when its underlying
+           section actually has data to compile (e.g. no allocation line
+           until a target is set) - omitted, not shown as "no data". -->
+      <div class="card">
+        <strong>Daily health check</strong>
+        <div id="investHealthList" style="margin-top:10px"></div>
+        <div class="chartbox tiny" style="margin-top:10px"><canvas id="investHealthTrendChart"></canvas></div>
+        <p class="muted" id="investHealthTrendEmpty" style="font-size:12px;margin:6px 0 0">Not enough history yet - check back after using the app on a few different days.</p>
       </div>
 
       <div class="totals">
@@ -763,8 +894,67 @@
            one (a blended 401(k), say) just shows its value. Explanation
            text (if tools/price-agent.js found one) shows under the row. -->
       <div class="card">
-        <strong>Holdings</strong>
+        <div class="topbar" style="margin-bottom:4px">
+          <strong>Holdings</strong>
+          <button class="secondary" id="addHoldingBtn" style="width:auto;padding:6px 10px;font-size:12px">+ Add stock</button>
+        </div>
+        <p class="muted" style="font-size:12px;margin:0 0 8px">Record the specific stocks, funds or coins you bought. An account's value is the total of its holdings.</p>
+        <!-- A holding is an `assets` row pointing at its account's asset via
+             parent_asset_id (40_asset_holdings.sql), not a separate table -
+             so the gain/loss and allocation math in investments.js reads it
+             with no changes. Cost basis is the TOTAL paid, not per share,
+             matching how assets.purchase_price is already used everywhere
+             else. -->
+        <div id="holdingForm" class="hidden" style="margin-bottom:12px;padding:12px;background:var(--panel-2);border-radius:10px">
+          <label>Account this sits in</label>
+          <select id="holdingAccount"></select>
+          <div class="row">
+            <div><label>Ticker / symbol</label><input id="holdingSymbol" placeholder="AAPL" autocapitalize="characters" /></div>
+            <div><label>Shares / units</label><input id="holdingQuantity" type="number" step="any" inputmode="decimal" placeholder="10" /></div>
+          </div>
+          <div class="row">
+            <div><label>Total cost basis</label><input id="holdingCostBasis" type="number" step="0.01" inputmode="decimal" placeholder="What you paid in total" /></div>
+            <div><label>Current value (optional)</label><input id="holdingValue" type="number" step="0.01" inputmode="decimal" placeholder="Defaults to cost basis until priced" /></div>
+          </div>
+          <label>Bucket (optional, for target allocation)</label>
+          <select id="holdingBucket"></select>
+          <p class="muted" style="font-size:12px;margin:8px 0 0">Current value is used until the price agent finds a live price for this symbol, after which shares x live price takes over.</p>
+          <div style="height:8px"></div>
+          <div class="row">
+            <button id="saveHoldingBtn">Save holding</button>
+            <button class="secondary" id="cancelHoldingBtn">Cancel</button>
+          </div>
+        </div>
         <div id="investHoldingsList" style="margin-top:8px"><p class="muted" style="font-size:13px">No investments added yet - add one from the Assets card on the Log page (Brokerage, IRA, 401(k), crypto, ...).</p></div>
+      </div>
+
+      <!-- One shared panel, retargeted per account - same "single form,
+           repositioned" pattern assetAdjustForm already uses for Checking/
+           Cash. amount/date only - kind='contribution' is what tells this
+           apart from an ordinary asset_adjust (app.js). -->
+      <div id="contributionForm" class="hidden" style="margin-bottom:12px;padding:12px;background:var(--panel-2);border-radius:10px">
+        <div class="topbar" style="margin-bottom:6px"><strong id="contributionLabel">Log a contribution</strong></div>
+        <div class="row">
+          <div><label>Amount</label><input id="contributionAmount" type="number" step="0.01" inputmode="decimal" placeholder="500" /></div>
+          <div><label>Date</label><input id="contributionDate" type="date" /></div>
+        </div>
+        <div style="height:8px"></div>
+        <div class="row">
+          <button id="saveContributionBtn">Log contribution</button>
+          <button class="secondary" id="cancelContributionBtn">Cancel</button>
+        </div>
+      </div>
+
+      <!-- Base 2025 IRS limits only (no catch-up, no income phase-outs) -
+           some types share a limit while others have their own. A
+           calculator against your own logged contributions, not
+           advice - only ever states the math, same boundary the Target
+           allocation card below already holds for what to buy. Only shows
+           a group the user actually has a qualifying account in. -->
+      <div class="card" id="contributionLimitsCard" style="display:none">
+        <strong>Contribution limits (this year)</strong>
+        <p class="muted" style="font-size:12px;margin:4px 0 8px">Base annual limits only - doesn't account for catch-up contributions, income phase-outs, or filing status. Verify against current IRS figures for your situation.</p>
+        <div id="contributionLimitsList"></div>
       </div>
 
       <!-- A calculator, not a recommendation - risk label and targets are
@@ -782,19 +972,11 @@
         </select>
         <div id="investTargetsList" style="margin-top:12px"><p class="muted" style="font-size:13px">No targets set yet.</p></div>
         <div class="row" style="margin-top:10px">
-          <input id="investTargetBucket" list="investBucketSuggestions" placeholder="Bucket (Stocks, Bonds...)" style="flex:1" />
+          <select id="investTargetBucket" style="flex:1"></select>
           <input id="investTargetPercent" type="number" step="0.1" min="0" max="100" inputmode="decimal" placeholder="Target %" style="flex:1" />
           <button id="saveInvestTargetBtn" style="width:auto;padding:6px 12px;font-size:12px">Set</button>
         </div>
       </div>
-
-      <datalist id="investBucketSuggestions">
-        <option value="Stocks"></option>
-        <option value="Bonds"></option>
-        <option value="Cash"></option>
-        <option value="Crypto"></option>
-        <option value="Real Estate"></option>
-      </datalist>
     </div>
 
   </div>
@@ -812,6 +994,19 @@
         <button class="secondary" id="confirmModalCancel">Cancel</button>
         <button class="secondary" id="confirmModalOk" style="color:var(--err);border-color:var(--err)">Delete</button>
       </div>
+    </div>
+  </div>
+
+  <!-- ============ ARCHIVED ACCOUNTS MODAL ============ -->
+  <!-- Archiving never touches the linked asset/liability, so an archived
+       account's balance still counts toward net worth exactly as before
+       (22_account_archive.sql) - that's why each row still shows its
+       balance here rather than reading as a deleted account. -->
+  <div id="archivedAcctModal" class="modal hidden">
+    <div class="sheet">
+      <div class="topbar"><strong>Archived accounts</strong><button class="secondary" id="archivedAcctClose" style="width:auto;padding:6px 12px">Close</button></div>
+      <p class="muted" style="font-size:12px;margin:6px 0 10px">Closed accounts, hidden from the Accounts card and from expense payment pickers. Their balances still count toward net worth.</p>
+      <div id="archivedAcctList"></div>
     </div>
   </div>
 
@@ -1047,7 +1242,264 @@
     </div>
   </div>
 
-  <!-- Bottom nav -->
+  <!-- ============ HELP MODAL ============ -->
+  <!-- One shared modal for all 4 pages' documentation, not four separate
+       modals - openHelp(page) (app.js) toggles which #helpContent* block
+       is visible and which pill is active, so every page's help stays
+       reachable from one open modal without closing and reopening.
+       Content lives here as plain HTML, not as app.js template strings -
+       this is long-form static reference text, not something computed
+       from live data, so it belongs with the rest of this file's static
+       structure the same way every other view's markup does. -->
+  <div id="helpModal" class="modal hidden">
+    <div class="sheet help-sheet">
+      <div class="topbar"><strong id="helpModalTitle">Help</strong><button class="secondary" id="helpClose" style="width:auto;padding:6px 12px">Close</button></div>
+      <div class="help-pills">
+        <button class="help-pill" data-help-page="log">Log</button>
+        <button class="help-pill" data-help-page="subs">Subscriptions/Bills</button>
+        <button class="help-pill" data-help-page="reports">Reports</button>
+        <button class="help-pill" data-help-page="invest">Investments</button>
+      </div>
+
+      <div id="helpContentLog" class="hidden">
+        <div class="help-diagram">
+          <svg viewBox="0 0 680 390" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="39" fill="var(--text)" font-size="14">Expenses Quick Add</text>
+            <rect x="10" y="64" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="93" fill="var(--text)" font-size="14">Recent History</text>
+            <rect x="10" y="118" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="147" fill="var(--text)" font-size="14">Budgets</text>
+            <rect x="10" y="172" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="201" fill="var(--text)" font-size="14">Net worth</text>
+            <rect x="10" y="226" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="255" fill="var(--text)" font-size="14">Accounts</text>
+            <rect x="10" y="280" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="309" fill="var(--text)" font-size="14">Assets</text>
+            <rect x="10" y="334" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="363" fill="var(--text)" font-size="14">Liabilities</text>
+          </svg>
+        </div>
+        <p class="muted" style="font-size:12px;margin:-10px 0 18px">Cards appear in this order, top to bottom. A budget-warning banner can appear above Quick Add; a Live asset prices card can appear between Assets and Liabilities once that dormant feature is turned on (see Assets below).</p>
+
+        <div class="help-topic">
+          <h3>Expenses Quick Add</h3>
+          <p>Type a whole expense as free text, e.g. "$14 lunch chipotle debit" - amount, merchant, and a matching account (if you name a payment type like "debit" or a bank name) are detected automatically as you type. This always works with no setup (a built-in keyword parser). If this household's optional Gemma server is configured (<code>GEMMA_ENDPOINT</code>), a second pass runs a moment later and can fill in fields the keyword parser missed or got less precisely - you'll see "Asking Gemma..." then "Parsed by Gemma" in small text under the field. Nothing is saved until you tap Save.</p>
+          <p>Four fields are required before Save will go through: Amount, Account, Category, Date. Any of the four that's still empty gets a live red border the whole time, not just after a rejected Save - it clears the instant you fill it in. Description/merchant is the only optional field.</p>
+          <p>If the account it guessed is wrong (or it couldn't guess), just pick the right one from the Account dropdown yourself - it never blocks you, it just doesn't guess when it isn't confident (for example, two Chase accounts and the text only says "chase").</p>
+          <p><strong>Import CSV</strong> (small button below the form) opens a 4-step wizard: pick a file, map its columns (which column is the date and which is the amount are required; description and category are optional, plus a checkbox if the file's amounts are recorded with the opposite sign this app expects), preview every row with likely duplicates flagged, then confirm. Imported rows are marked as history that already happened, so they never touch your account balances a second time (your balance should already reflect them in real life) - use the "Undo this import" button right after if you picked the wrong file or mapping.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Recent History</h3>
+          <p>A combined feed of every expense and every non-expense money movement (a manual balance correction, a liability payment, an investment contribution, a logged interest charge, even an account being opened) - not just expenses. Search by merchant/description text, or narrow with the Type/Account/Category/Kind dropdowns and a min/max dollar range - all filters combine (AND, not OR). "Kind" is the one that separates plain expenses from everything else (account activity has no category or payment type of its own, so it drops out of those two filters automatically unless you pick "Activity only").</p>
+          <p>Tap an expense row to open it for editing or recategorizing. Account-activity rows (anything that isn't a plain expense) can't be edited that way since most of them have no separate edit form - instead every row, expense or activity, has a small undo icon that reverses exactly what it did (restores the old balance, removes the row) and can't be used twice.</p>
+          <p>Check the box on several expense rows at once to recategorize all of them together in one Apply - your checked selection survives changing the filters above it, so you can search, check a few, search again, and check more before applying.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Budgets</h3>
+          <p>A monthly spending limit per category. Unlike the charts on the Reports page, a budget always applies to the <em>current</em> real-world month - it doesn't follow any month picker. Once you're at 90% of a limit the bar turns amber; over it, red, and a "Budget warning" banner appears at the very top of this page (and a toast fires right at the moment a save actually crosses the line). Set a category's limit again to change it; tap the ✕ to remove it entirely.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Net worth</h3>
+          <p>Assets total minus liabilities total (tracked debts only) - a single number, read-only here. It deliberately does not subtract subscriptions or general spending: a subscription is a recurring future cost, not a debt you owe today, and ordinary spending already reduced an asset's balance directly the moment you logged it. See the Reports page for how this number trends over time.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Accounts</h3>
+          <p>Payment methods only - which card, bank, or wallet you paid with. Accounts are <strong>not</strong> counted in net worth by themselves; every account automatically gets its own linked Asset (a debit/deposit-style account) or Liability (a credit-style account) behind the scenes, and that linked balance is what actually counts. "+ Add" walks you through picking a type (this decides the account's name, like Checking or Credit Card) and typing the bank or institution name - for a real bank/credit union this is checked against a large built-in list as you type, and if it's genuinely not on the list you're offered an "add it anyway" option rather than being blocked outright.</p>
+          <p>Tap any account circle to adjust its balance directly: type the new total, or use +/- if you only know the change. A credit-type account instead shows Pay/adjust-owed controls from the Liabilities card below, plus a credit-utilization line and (once you've filled in its statement-cycle details there) a paid-in-full / carrying-a-balance / missed-minimum status. Archiving an account (the small "Archive" link under a circle) removes it from every list and total while keeping its full history intact and fully reversible from "View archived" - unlike the ✕ delete, which is permanent and unassigns its past expenses.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Assets</h3>
+          <p>Everything you own that counts toward net worth - not just accounts. "+ Add asset" covers standalone things with no linked account: an Investment, Property, Vehicle, a retirement account you're tracking on its own, or any of roughly fifty specific types (brokerage, 401(k)/Roth/Traditional variants, HSA, crypto, and more). A Vehicle gets an optional depreciation estimate (purchase price, date, and a yearly rate) instead of you updating its value by hand. An investment-flavored asset gets an optional cost basis and allocation bucket, both used on the Investments page; adding a ticker/symbol and quantity here also lets the dormant live-price feature (once a household server is set up for it) price it automatically - see the Investments page's help for the fuller picture, including per-ticker holdings inside an account.</p>
+          <p>A CD's maturity date shows an upcoming-renewal reminder here once it's within 30 days. Any manually-priced asset (no live feed) that hasn't been touched in 6+ months gets a gentle "this might be stale" notice, just as a reminder to check it's still accurate - nothing changes automatically.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Liabilities</h3>
+          <p>Tracked debt only, split into two groups: <strong>Credit liabilities</strong> are the automatic ones tied to a credit-type Account above (their balance moves only through real charges/payments, or a manual correction - see below); <strong>Other liabilities</strong> are standalone ones you add directly here (Loan, Mortgage, or a specific type like a HELOC or student loan) with no linked account.</p>
+          <p>"Pay" on any liability moves money from a linked asset/account you pick straight to paying it down. The balance can also be corrected directly - set it to an exact figure, or add a specific charge - which is useful when the real statement doesn't quite match what got logged (a fee, a late-arriving charge, a refund); every one of these corrections is written to Recent History as an undoable entry, so nothing changes the amount owed silently.</p>
+          <p>"Edit details" (small link under any liability) opens interest rate, minimum payment, and due date for any liability, plus type-specific fields: a credit limit (adds a plain utilization line - "$X of $Y used" - once both a limit and balance exist, deliberately with no "aim for under 30%" advice, just the math) for a card/HELOC/line of credit; statement-cycle fields (which day the statement closes, which day payment is due, the last statement balance and date) for a real revolving card, which power a paid-in-full / carrying-a-balance / missed-minimum indicator - paying the statement balance in full by the due date means no interest at all, carrying any of it accrues interest even if every payment was on time, and paying only the minimum avoids a late fee but not the interest. Nothing here is ever applied automatically; you confirm each interest charge yourself from the small "Log interest" link when it's ready. A HELOC additionally gets a draw-period-end date.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Profile (top right)</h3>
+          <p>Account security is at the top: your sign-in email (read-only) and a place to set or change your password - this is what actually keeps an installed home-screen icon signed in (a magic-link email always opens in regular Safari, which an installed icon can't reach). Below that, two optional groups: deal-eligibility details (military/student/first-responder status, and so on) used to match you against real subscription discounts on the Subscriptions/Bills page, and financial-context details (housing, employment, household size, goals) used only to give the Reports page's "Ask about your spending" feature something real to reason about - neither group is used anywhere else. "Download all my data" exports a plain JSON file of everything in your own tables.</p>
+        </div>
+      </div>
+      <div id="helpContentSubs" class="hidden">
+        <div class="help-diagram">
+          <svg viewBox="0 0 680 282" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="39" fill="var(--text)" font-size="14">Recurring expenses found (only when any are detected)</text>
+            <rect x="10" y="64" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="93" fill="var(--text)" font-size="14">Savings found</text>
+            <rect x="10" y="118" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="147" fill="var(--text)" font-size="14">Found online (dormant feature)</text>
+            <rect x="10" y="172" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="201" fill="var(--text)" font-size="14">Upcoming renewals (30 days)</text>
+            <rect x="10" y="226" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="255" fill="var(--text)" font-size="14">All subscriptions/bills</text>
+          </svg>
+        </div>
+        <p class="muted" style="font-size:12px;margin:-10px 0 18px">"Recurring expenses found" only appears when the app spots a bill-like pattern in your expense history. "Found online" only appears once a household server for that dormant feature is running - see its own note below.</p>
+
+        <div class="help-topic">
+          <h3>Monthly total / Yearly</h3>
+          <p>The sum of every <em>active</em> subscription/bill's amount, normalized to a month and a year regardless of each one's own billing cycle (a $120/year plan counts as $10/month here). This is a forecast based on what you've entered, not a count of real charges - a charge only becomes real, dated spending once you use Mark as paid (see below) or it shows up through Quick Add/CSV import like any other expense.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Recurring expenses found</h3>
+          <p>Only shown when your expense history has a pattern that looks like a bill (the same merchant, a similar amount, roughly the same interval). Tap one to start tracking it here as a real subscription/bill instead of just a repeating expense - nothing is created automatically without you tapping it.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Savings found</h3>
+          <p>Compares what you're paying against a small built-in catalog of plan types (student, military, family-plan, and similar eligible pricing) using your Profile's deal-eligibility fields (military/student/first-responder status, and so on) - fill those in on the Log page's Profile modal to get real matches here.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Found online</h3>
+          <p>A dormant, optional feature: a separate household server can search the web for live subscription pricing and write candidate findings here, clearly labeled "unverified" with a link to check the source before you trust it - nothing here is ever applied automatically. Hidden entirely until that server is set up and turned on; the app works completely fine without it.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Add / edit a subscription or bill</h3>
+          <p>"+ Add" (top right, or at the bottom of the full list) opens a form: service name, a free-typed category (with suggestions from common ones, but you can type your own), amount, billing cycle (monthly/quarterly/semiannual/annual/other), next renewal date, which account it's paid from, an Active checkbox (inactive ones drop out of the Monthly/Yearly totals and upcoming renewals), an Essential checkbox (a bill you need, versus a discretionary subscription - recorded for your own reference), and notes.</p>
+          <p><strong>Mark as paid</strong> (only shown once the subscription has an account linked and has been saved) logs today's date as a real, dated expense against that account - the exact same effect on your balances as typing it into Quick Add - and automatically rolls the next-renewal date forward by one billing cycle. Use it the day you're actually charged, not when you first set the subscription up.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Upcoming renewals / All subscriptions</h3>
+          <p>Upcoming renewals lists anything due in the next 30 days, for a quick glance - it's read-only here, tap the full list below to actually edit one. All subscriptions/bills is the complete list, active and inactive both; tap any row to open it back in the edit form above.</p>
+        </div>
+      </div>
+      <div id="helpContentReports" class="hidden">
+        <div class="help-diagram">
+          <svg viewBox="0 0 680 498" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="39" fill="var(--text)" font-size="14">Ask about your spending</text>
+            <rect x="10" y="64" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="93" fill="var(--text)" font-size="14">Monthly report</text>
+            <rect x="10" y="118" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="147" fill="var(--text)" font-size="14">Monthly Expense Log</text>
+            <rect x="10" y="172" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="201" fill="var(--text)" font-size="14">By category</text>
+            <rect x="10" y="226" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="255" fill="var(--text)" font-size="14">By account</text>
+            <rect x="10" y="280" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="309" fill="var(--text)" font-size="14">By payment type</text>
+            <rect x="10" y="334" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="363" fill="var(--text)" font-size="14">Last 6 months</text>
+            <rect x="10" y="388" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="417" fill="var(--text)" font-size="14">Account balance history</text>
+            <rect x="10" y="442" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="471" fill="var(--text)" font-size="14">Net worth trend</text>
+          </svg>
+        </div>
+        <p class="muted" style="font-size:12px;margin:-10px 0 18px">Cards appear in this order, top to bottom. The month selector (top right) and its "Selected month" / "Subscriptions/Bills" totals apply to everything except the last three cards - see below for which.</p>
+
+        <div class="help-topic">
+          <h3>Month selector and totals</h3>
+          <p>Everything on this page except the bottom three cards (Account balance history, Net worth trend, and indirectly the Q&A/monthly report below) is scoped to whichever month you pick at the top right. The two totals under it are that month's full expense total and just its Subscriptions category slice.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Ask about your spending</h3>
+          <p>Type a question in plain English (e.g. "How much did I spend on food last month?") and get an answer generated from your own real data - optional, and only works if this household has a Gemma server configured; otherwise it tells you plainly that it isn't set up rather than guessing. It can also draw on your Profile's financial-context fields (housing, employment, goals) if you've filled those in, for a more useful answer to something like "should I pay down debt or save right now?" - it never gives investment advice, only reasons about the numbers you've actually entered.</p>
+          <p>Questions can also reach further back than the usual recent-months data: a background search looks through your older transactions for whatever specifically relates to your question (e.g. "what did I spend on my trip in 2019") and adds just those to what the AI sees, on top of - not instead of - the regular recent-months data. A line under the answer says how many older transactions were found when this happens. Like the rest of this feature, it's optional and silently does nothing extra if it isn't set up yet.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Monthly report</h3>
+          <p>A written summary generated on a schedule by a separate household server, not something you trigger from here - shows "No monthly reports yet" until that optional service has actually run at least once. The app is fully usable without it.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Monthly Expense Log</h3>
+          <p>Every plain expense in the selected month (not account activity like balance corrections - this list is about spending specifically). Tap one to edit or recategorize it, same as Recent History on the Log page. CSV exports the visible rows to a spreadsheet file; Print / PDF opens a clean, separate printable page you can save as a PDF from your browser's own print dialog.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>By category / By account / By payment type</h3>
+          <p>Three bar-chart breakdowns of the selected month's spending, sliced three different ways - which category it went to, which account paid it, and debit vs. credit vs. cash. Each bar's dollar amount is written right on the label so you don't need to hover to read it.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Last 6 months</h3>
+          <p>A bar per month, total spending only, for the six months ending at whichever month is selected above - the one chart on this page that shows more than a single month at once (everything else above it is that one month only).</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Account balance history</h3>
+          <p>Pick any account from the dropdown to see its balance over time, reconstructed from its actual expense and activity history - not scoped to the month selector, since a balance's history spans the account's whole lifetime, not one month.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Net worth trend</h3>
+          <p>One point per calendar day you actually had the app open (net worth is snapshotted automatically on load, at most once a day) - a day you never opened the app simply has no point, rather than a guessed value filling the gap. Also not scoped to the month selector, for the same whole-lifetime reason as the account history chart above. Needs at least two days of history before a line can be drawn at all.</p>
+        </div>
+      </div>
+      <div id="helpContentInvest" class="hidden">
+        <div class="help-diagram">
+          <svg viewBox="0 0 680 336" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="39" fill="var(--text)" font-size="14">Market overview + top movers (dormant feature)</text>
+            <rect x="10" y="64" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="93" fill="var(--text)" font-size="14">Daily health check + totals</text>
+            <rect x="10" y="118" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="147" fill="var(--text)" font-size="14">Value over time</text>
+            <rect x="10" y="172" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="201" fill="var(--text)" font-size="14">Holdings</text>
+            <rect x="10" y="226" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="255" fill="var(--text)" font-size="14">Contribution limits (only if you have a tracked account type)</text>
+            <rect x="10" y="280" width="660" height="46" rx="10" fill="var(--panel-2)" stroke="var(--border)"/>
+            <text x="40" y="309" fill="var(--text)" font-size="14">Target allocation</text>
+          </svg>
+        </div>
+        <p class="muted" style="font-size:12px;margin:-10px 0 18px">Cards appear in this order, top to bottom. "Market overview" only appears once a household server for that dormant feature is running.</p>
+
+        <div class="help-topic">
+          <h3>Market overview</h3>
+          <p>Today's level and day-over-day change for a handful of major US indexes (S&P 500, Dow Jones, NASDAQ Composite, Russell 2000) - genuinely separate from your own holdings below, this is broad market context, not anything you own. A dormant, optional feature: hidden entirely until a household server is running to look prices up (the same $0-cost search-based pipeline the live-holding prices below use), and even then, an individual index just shows "not available yet" until it's actually been found once.</p>
+          <p>Below the indexes, "Today's top movers" ranks the biggest day-over-day price swings (up or down) from a fixed watchlist of 20 well-known large-cap stocks, each with a short plain-English explanation of why it moved when one's been found. This is informational only, purely about stocks already on the fixed watchlist - not a scan of the whole market, and never a suggestion of what to buy or sell. It appears independently of the indexes above it, so it's possible to see one without the other depending on what the agent has found so far.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Daily health check</h3>
+          <p>A short, plain-English compilation of numbers already shown elsewhere on this page - never a made-up score. Up to five lines, each only shown when there's something real to say: today's dollar change (or a note that no live pricing exists yet), total gain or loss since cost basis, the single furthest-off-target allocation bucket (only if you've set targets), a flag if any contribution group is over or close to its annual limit (only if you're tracking one), and how many of your holdings currently have a live price. A small colored dot on each line is green for good, red for something worth a look, gray for "no data yet" - and a compact recent-trend chart sits right below it.</p>
+          <p>The four stat tiles under it (Total value, Total gain/loss, Today's change, Cost basis) are the same underlying numbers, just as plain totals - Today's change specifically needs at least two days of live price history before it can show anything.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Value over time</h3>
+          <p>One point per calendar day you had the app open, same snapshot approach as the Reports page's net worth trend - needs at least two days of history before a line appears.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Holdings</h3>
+          <p>Every investment-type asset, grouped by account: a plain account (like a 401(k) with no per-ticker detail) shows just its own value, while "+ Add stock" lets you record the actual tickers/coins bought inside any eligible account (Brokerage, IRA, crypto, and similar) - shares, total cost basis, and an optional current value (defaults to cost basis until a live price arrives). A ticker you type is checked against a large built-in list; a genuine miss offers an "add it anyway" confirmation rather than blocking you. Once a household server for live pricing is running, a priced holding also shows today's gain/loss, a day-change figure, and sometimes a short note on why the price moved. "Log contribution" under any account records new money you actually put in (as opposed to the account simply growing in value) - this is what the Contribution limits card below is measured against, so it deliberately only counts real deposits, never market gains.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Contribution limits</h3>
+          <p>Only appears if you have at least one account type this app tracks a clean annual IRS limit for (like a 401(k) or an IRA) - shows this year's logged contributions against the base limit, in red once over. These are base figures only (no catch-up contributions, no income phase-outs, no filing status), so treat them as a reference, not a substitute for checking your real numbers.</p>
+        </div>
+
+        <div class="help-topic">
+          <h3>Target allocation</h3>
+          <p>A calculator, not advice: set a risk label for your own reference (it isn't used in any calculation) and a target percentage for each bucket (Stocks, Bonds, Cash, Crypto, Real Estate, Other) that you've tagged your assets/holdings with. It only ever shows your current percentage against that target and the dollar gap between them - it never tells you what to actually buy or sell, and never will.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Top nav -->
   <nav id="nav" class="nav hidden">
     <button id="navLog" class="active">Log</button>
     <button id="navSubs">Subscriptions/Bills</button>

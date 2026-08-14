@@ -10,6 +10,15 @@
 import { CATEGORIES } from "./categorize.js";
 
 const PAYMENTS = ["credit", "debit", "cash"];
+// Ollama's per-request override for how long a model stays loaded after
+// this call - deliberately NOT the home machine's own OLLAMA_KEEP_ALIVE
+// env var, which is global and would also affect any other model sharing
+// that machine (e.g. a coding-assistant model). Set here instead so only
+// this app's own usage gets a longer keep-alive, without touching the
+// machine's own tuning for its other uses. Doesn't help a genuinely cold
+// first request (that one still has to wait out the load), just makes a
+// second call shortly after the first skip the reload.
+const GEMMA_KEEP_ALIVE = "10m";
 
 /** Build the strict-JSON extraction prompt sent to Gemma. */
 export function buildPrompt(text, today) {
@@ -66,10 +75,10 @@ function extractPayload(data) {
  * Parse free text via Gemma. Resolves to a normalized expense object, or throws
  * (caller falls back to keyword parsing). Times out so it never blocks the UI.
  * @param {string} text
- * @param {{endpoint:string, model?:string, timeoutMs?:number, today?:string}} opts
+ * @param {{endpoint:string, model?:string, key?:string, timeoutMs?:number, today?:string}} opts
  */
 export async function parseWithGemma(text, opts = {}) {
-  const { endpoint, model = "gemma", timeoutMs = 4000 } = opts;
+  const { endpoint, model = "gemma", key, timeoutMs = 4000 } = opts;
   const today = opts.today || new Date().toISOString().slice(0, 10);
   if (!endpoint) throw new Error("Gemma endpoint not configured");
 
@@ -78,8 +87,8 @@ export async function parseWithGemma(text, opts = {}) {
   try {
     const res = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, prompt: buildPrompt(text, today), stream: false, format: "json" }),
+      headers: { "Content-Type": "application/json", ...(key ? { "X-Gemma-Key": key } : {}) },
+      body: JSON.stringify({ model, prompt: buildPrompt(text, today), stream: false, format: "json", keep_alive: GEMMA_KEEP_ALIVE }),
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(`Gemma HTTP ${res.status}`);
@@ -87,6 +96,36 @@ export async function parseWithGemma(text, opts = {}) {
     const parsed = validateParsed(payload, today);
     if (!parsed) throw new Error("Gemma returned an unusable shape");
     return parsed;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Fire a minimal "ping" prompt to load the model into memory ahead of a
+ * real request - same warm-up shape tools/price-agent.js already uses
+ * server-side. Called when the Reports page opens (before the user has
+ * typed a question) so the ~11-16s cold-load measured on the home machine
+ * happens in the background instead of counting
+ * against the Ask button's wait. Fire-and-forget by design: any failure
+ * here (unreachable endpoint, timeout) just means the next real call pays
+ * the cold-start cost instead, exactly like today - never surface an error
+ * to the user for a warm-up they didn't ask for.
+ */
+export async function warmUpGemma(opts = {}) {
+  const { endpoint, model = "gemma", key, timeoutMs = 20000 } = opts;
+  if (!endpoint) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(key ? { "X-Gemma-Key": key } : {}) },
+      body: JSON.stringify({ model, prompt: "ping", stream: false, keep_alive: GEMMA_KEEP_ALIVE }),
+      signal: controller.signal,
+    });
+  } catch {
+    // best-effort only - silently ignored, see comment above
   } finally {
     clearTimeout(timer);
   }
@@ -103,8 +142,11 @@ export function buildQaPrompt(question, context) {
     "You are a personal finance assistant. Answer the question using ONLY",
     "the JSON data below, which is the user's own spending data plus",
     "optional profile context (employment, housing, household size,",
-    "dependents, financial goals) if they've filled it in. If the data",
-    "doesn't contain enough to answer, say so plainly instead of guessing.",
+    "dependents, financial goals) if they've filled it in. The data may",
+    "also include relevant_history - older transactions found via search",
+    "specifically because they relate to this question, separate from the",
+    "regular recent-months transactions list. If the data doesn't contain",
+    "enough to answer, say so plainly instead of guessing.",
     "Be concise - a few sentences or a short list. Use $ for dollar amounts.",
     "",
     `Data: ${JSON.stringify(context)}`,
@@ -118,7 +160,7 @@ export function buildQaPrompt(question, context) {
  * plain-text answer, or throws (caller shows a friendly error).
  */
 export async function askGemma(question, context, opts = {}) {
-  const { endpoint, model = "gemma", timeoutMs = 20000 } = opts;
+  const { endpoint, model = "gemma", key, timeoutMs = 20000 } = opts;
   if (!endpoint) throw new Error("Gemma endpoint not configured");
   if (!question || !question.trim()) throw new Error("Ask a question first");
 
@@ -127,8 +169,8 @@ export async function askGemma(question, context, opts = {}) {
   try {
     const res = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, prompt: buildQaPrompt(question, context), stream: false }),
+      headers: { "Content-Type": "application/json", ...(key ? { "X-Gemma-Key": key } : {}) },
+      body: JSON.stringify({ model, prompt: buildQaPrompt(question, context), stream: false, keep_alive: GEMMA_KEEP_ALIVE }),
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(`Gemma HTTP ${res.status}`);
@@ -136,6 +178,44 @@ export async function askGemma(question, context, opts = {}) {
     const text = typeof data.response === "string" ? data.response.trim() : "";
     if (!text) throw new Error("Gemma returned an empty answer");
     return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---- RAG retrieval for the Q&A above ---------------------------------------
+// Separate contract again: POSTs to an Ollama-compatible /api/embeddings
+// endpoint (not /api/generate) with { model, prompt }, which returns
+// { embedding: [...] } - a plain float array, not the { response } shape
+// the two functions above expect. Used by app.js to embed the user's
+// question before a vector search against expense_embeddings
+// (supabase/45_expense_embeddings.sql) - see that migration's header for
+// why retrieval augments buildQaContext's existing recent-window data
+// rather than replacing it.
+
+/**
+ * Embed a piece of text via Gemma. Resolves to a float vector, or throws
+ * (caller treats retrieval as best-effort and falls back to no relevant
+ * history, same posture as every other Gemma call in this file).
+ */
+export async function embedText(text, opts = {}) {
+  const { endpoint, model = "gemma", key, timeoutMs = 10000 } = opts;
+  if (!endpoint) throw new Error("Gemma embeddings endpoint not configured");
+  if (!text || !text.trim()) throw new Error("Nothing to embed");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(key ? { "X-Gemma-Key": key } : {}) },
+      body: JSON.stringify({ model, prompt: text }),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`Gemma HTTP ${res.status}`);
+    const data = await res.json();
+    if (!Array.isArray(data.embedding)) throw new Error("Gemma returned no embedding");
+    return data.embedding;
   } finally {
     clearTimeout(timer);
   }

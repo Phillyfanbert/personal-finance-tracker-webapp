@@ -1,6 +1,6 @@
 // ============================================================================
-// Per-category budgets. Pure, unit-testable - same style as
-// networth.js/depreciation.js.
+// Per-category budgets. Pure,
+// unit-testable - same style as networth.js/depreciation.js.
 // ============================================================================
 
 const r2 = (n) => Math.round(n * 100) / 100;

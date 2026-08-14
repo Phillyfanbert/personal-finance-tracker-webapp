@@ -1,5 +1,5 @@
--- Live-priced asset values, built on the same dormant SearXNG+Gemma
--- pipeline as F6's deal_findings (04_deal_findings.sql)
+-- Live-priced asset values, built on the same
+-- dormant SearXNG+Gemma pipeline as F6's deal_findings (04_deal_findings.sql)
 -- rather than a paid price API, per explicit user choice - the $0/no-card
 -- constraint (README 1.4) rules out virtually every real market-data API.
 --

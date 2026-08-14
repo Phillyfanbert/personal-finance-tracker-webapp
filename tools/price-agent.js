@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // ============================================================================
-// Live asset price agent. Same architecture as tools/deal-agent.js (F6),
-// reused rather than duplicated conceptually -
+// Live asset price agent. Same architecture as
+// tools/deal-agent.js (F6), reused rather than duplicated conceptually -
 // runs on the SERVER MACHINE ONLY, alongside SearXNG and Ollama. Never runs
 // in the browser, never ships in the PWA, needs the Supabase SERVICE_ROLE
 // key - keep that out of the repo (env var only).
@@ -17,10 +17,11 @@
 // deal_findings already uses for service prices):
 //   1. Query SearXNG for the symbol's current price, keeping only results
 //      on a small hardcoded allowlist of reputable finance-data domains
-//      (TRUSTED_PRICE_DOMAINS below) - same "never guess a domain"
-//      posture tools/deal-agent.js already uses for service pricing
-//      pages, just a fixed list instead of a per-service table, since
-//      price sources are generic rather than per-symbol.
+//      (TRUSTED_PRICE_DOMAINS below) - same "never guess a domain" posture
+//      already established by the Option C decision,
+//      just a fixed list instead of a per-service table, since price
+//      sources are generic rather than per-symbol the way subscription
+//      pricing pages are per-service.
 //   2. Fetch each surviving page's text and ask Gemma to extract a price as
 //      strict JSON (same pattern as app/gemma.js's parseWithGemma).
 //   3. If a price was found, one more best-effort step: search for recent
@@ -34,6 +35,12 @@
 //   4. Write validated findings to asset_price_findings via the REST API
 //      using the service_role key (bypasses RLS by design).
 //
+// Also runs the exact same 4-step pipeline against a small FIXED list of
+// major market indexes (MARKET_INDEXES below - S&P 500, NASDAQ, ...),
+// writing to a separate market_index_findings table instead (Investments
+// tab's Daily overview) - see that constant's own comment for why this
+// reuses processSymbol()/findExplanation() unchanged rather than forking.
+//
 // Setup (on the server machine, next to Ollama and deal-agent.js):
 //   Shares tools/.env.deal-agent (same env vars, see that file's header) -
 //   no separate env file needed. Run directly:
@@ -42,12 +49,13 @@
 //   Or via tools/run-price-agent.sh, which brings SearXNG up/down around it,
 //   same as tools/run-deal-agent.sh does for the deal agent.
 //
-// Scheduling: not wired up yet, same as tools/deal-agent.js - run manually
-// or via your own cron/systemd timer for now. A price goes stale far
-// faster than a subscription plan price does, so this probably wants a
-// tighter interval than deal-agent.js's weekly cadence once that's set
-// up - daily, maybe, not continuously (same hammering-SearXNG concern
-// deal-agent.js's own header already raises).
+// Scheduling: not wired up yet (the F6 Phase D item - same
+// unresolved question applies here) - run manually or via your own
+// cron/systemd timer for now. A price goes stale far faster than a
+// subscription plan price does, so this probably wants a tighter interval
+// than deal-agent.js's weekly cadence once that's set up - daily, maybe,
+// not continuously (same hammering-SearXNG concern deal-agent.js's own
+// header already raises).
 // ============================================================================
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -366,16 +374,55 @@ async function processSymbol(symbol) {
   return findings;
 }
 
+// ---- Market indexes (Investments tab, Daily overview) ---------------------
+// Fixed - unlike the per-user watchlist above, a market index isn't
+// something anyone "holds," so this always runs every time regardless of
+// what any user's assets.price_symbol contains. Mirror this list in
+// app.js's own MARKET_INDEXES if it ever changes - this file has no
+// import/export machinery to share it with app/*.js, same as
+// TRUSTED_PRICE_DOMAINS already has no client-side counterpart either.
+//
+// Deliberately reuses processSymbol()/findExplanation() unchanged rather
+// than forking parallel index-specific query/prompt builders: passing a
+// full plain-English label ("S&P 500") as the "symbol" already produces
+// sensible search queries and a sensible Gemma extraction target (the
+// prompts don't hard-require a ticker shape), and market_index_findings'
+// columns deliberately mirror asset_price_findings' for exactly this
+// reuse. The wording in buildExplanationPrompt ("why a stock or crypto
+// price moved") is slightly imprecise for an index - accepted as
+// best-effort, same honesty stance the rest of this file already takes on
+// explanation quality, rather than forking the whole pipeline to fix one
+// word.
+const MARKET_INDEXES = ["S&P 500", "Dow Jones Industrial Average", "NASDAQ Composite", "Russell 2000"];
+
+// ---- Market movers watchlist (Investments tab, "Today's top movers") -----
+// A fixed, curated list of well-known large-cap stocks - NOT each user's
+// own holdings (that's the per-user watchlist above) - so the UI can rank
+// "today's biggest movers" even for a user who holds nothing. Same category
+// as MARKET_INDEXES immediately above (public market data, tied to no
+// user), so it's searched the same way and written to the SAME
+// market_index_findings table rather than a new one - that table's real
+// meaning was always "public market data," not literally "indexes only."
+// Must match app.js's own MARKET_MOVERS_WATCHLIST constant, kept in sync by
+// hand for the same reason MARKET_INDEXES already is.
+const MARKET_MOVERS_WATCHLIST = [
+  "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "UNH",
+  "XOM", "JNJ", "WMT", "PG", "MA", "HD", "DIS", "NFLX", "AMD", "KO",
+];
+
 // ---- Main ----------------------------------------------------------------
 async function main() {
   requireEnv();
 
   const watchlist = await loadWatchlist();
-  if (!watchlist.length) {
-    console.log("No assets have a price_symbol set - nothing to search for. Exiting.");
+  console.log(`Watchlist (${watchlist.length}): ${watchlist.join(", ")}`);
+  console.log(`Market indexes (${MARKET_INDEXES.length}): ${MARKET_INDEXES.join(", ")}`);
+  console.log(`Market movers watchlist (${MARKET_MOVERS_WATCHLIST.length}): ${MARKET_MOVERS_WATCHLIST.join(", ")}`);
+
+  if (!watchlist.length && !MARKET_INDEXES.length && !MARKET_MOVERS_WATCHLIST.length) {
+    console.log("Nothing to search for. Exiting.");
     return;
   }
-  console.log(`Watchlist (${watchlist.length}): ${watchlist.join(", ")}`);
 
   console.log("Warming up Gemma...");
   await warmUpGemma();
@@ -387,13 +434,32 @@ async function main() {
     console.log(`  -> ${findings.length} finding(s)`);
     allFindings.push(...findings);
   }
-
-  if (!allFindings.length) {
-    console.log("No findings this run.");
-    return;
+  if (allFindings.length) {
+    await sbInsert("asset_price_findings", allFindings);
+    console.log(`Wrote ${allFindings.length} finding(s) to asset_price_findings.`);
+  } else {
+    console.log("No asset findings this run.");
   }
-  await sbInsert("asset_price_findings", allFindings);
-  console.log(`Wrote ${allFindings.length} finding(s) to asset_price_findings.`);
+
+  const allIndexFindings = [];
+  for (const label of MARKET_INDEXES) {
+    console.log(`Searching index: ${label}`);
+    const findings = await processSymbol(label);
+    console.log(`  -> ${findings.length} finding(s)`);
+    allIndexFindings.push(...findings);
+  }
+  for (const symbol of MARKET_MOVERS_WATCHLIST) {
+    console.log(`Searching mover: ${symbol}`);
+    const findings = await processSymbol(symbol);
+    console.log(`  -> ${findings.length} finding(s)`);
+    allIndexFindings.push(...findings);
+  }
+  if (allIndexFindings.length) {
+    await sbInsert("market_index_findings", allIndexFindings);
+    console.log(`Wrote ${allIndexFindings.length} finding(s) to market_index_findings (indexes + movers watchlist).`);
+  } else {
+    console.log("No market index or movers findings this run.");
+  }
 }
 
 main().catch((err) => {

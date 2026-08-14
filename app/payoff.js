@@ -1,6 +1,6 @@
 // ============================================================================
-// Liability payoff projection. Pure, unit-testable - same style as
-// depreciation.js/networth.js. Uses the
+// Liability payoff projection. Pure,
+// unit-testable - same style as depreciation.js/networth.js. Uses the
 // interest_rate/minimum_payment fields liabilities have always stored but
 // never actually used in any calculation until now.
 // ============================================================================

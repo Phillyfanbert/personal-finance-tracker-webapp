@@ -1,4 +1,4 @@
--- Investments tab (docs/SESSION-NOTES.md). investment_bucket is a
+-- Investments tab. investment_bucket is a
 -- user-assigned free-text label ("Stocks", "Bonds", "Cash", ...) used by
 -- the target-allocation calculator to group holdings - free text + a
 -- <datalist> of suggestions in the UI, same pattern accounts.bank_name/

@@ -3,9 +3,9 @@
 // Pure, unit-testable. No new table/migration: every balance change an
 // account has ever had is already fully reconstructable from `expenses` +
 // `account_activity`, since this app's whole asset/liability-delta model
-// already requires every mutation to be a real, dated row - so walking
-// backward from the current balance recovers the exact history rather
-// than needing a separate snapshot table to duplicate it.
+// already requires every mutation to be a real, dated row - so
+// walking backward from the current balance recovers the exact history
+// rather than needing a separate snapshot table to duplicate it.
 // ============================================================================
 
 const r2 = (n) => Math.round(n * 100) / 100;

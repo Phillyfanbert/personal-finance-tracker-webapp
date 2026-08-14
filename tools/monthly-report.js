@@ -23,8 +23,8 @@
 //   DRY_RUN=1 node tools/monthly-report.js   # prints report text, no writes
 //
 // Intended schedule: monthly, e.g. the 1st of each month, covering the
-// month that just ended. A cron/systemd timer entry (same pattern as
-// run-deal-agent.sh) is a one-line addition once you're ready to schedule it.
+// month that just ended. A cron/systemd timer entry (Phase D-style) is a
+// one-line addition once you're ready to schedule it.
 // ============================================================================
 
 const SUPABASE_URL = process.env.SUPABASE_URL;

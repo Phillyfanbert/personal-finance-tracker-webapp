@@ -1,11 +1,11 @@
 -- ============================================================================
--- Expand accounts/assets/liabilities/expenses type enums to cover ~42 real
--- bank/credit/loan/retirement/specialty account types, not just Checking/
--- Savings/Credit/Cash. Deliberately excludes two categories that aren't
--- personal payment-method accounts: business accounts (out of scope for
--- this personal-finance app) and escrow accounts (a sub-ledger belonging
--- to a mortgage servicer, not something an individual opens or selects as
--- a payment method).
+-- Expand accounts/assets/liabilities/expenses type enums to cover every
+-- documented account type, not just Checking/
+-- Savings/Credit/Cash. Deliberately excludes two categories the doc itself
+-- flagged as not personal payment-method accounts: business accounts (out
+-- of scope for this app's personal-finance focus) and escrow accounts
+-- (a sub-ledger belonging to a mortgage servicer, not something an
+-- individual opens or selects as a payment method).
 --
 -- accounts.type and expenses.payment_type are kept as an identical list on
 -- purpose - payment_type is always read directly off the selected

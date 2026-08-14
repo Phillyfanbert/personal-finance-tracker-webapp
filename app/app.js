@@ -12,8 +12,10 @@ import {
 import { buildBalanceHistory } from "./accountHistory.js";
 import { estimateValue, effectiveAssetValue } from "./depreciation.js";
 import { payoffProjection } from "./payoff.js";
+import { cycleDates, cycleStatus } from "./creditCycle.js";
 import { budgetStatus } from "./budgets.js";
-import { investmentHoldings, portfolioTotals, allocationVsTarget } from "./investments.js";
+import { investmentHoldings, portfolioTotals, allocationVsTarget, contributionLimitUsage, portfolioHealthSummary, marketIndexSummary, topMarketMovers } from "./investments.js";
+import { ALL_SECURITY_TICKERS, CRYPTO_SYMBOLS } from "./tickers.js";
 import {
   guessColumnMapping, guessSignConvention, normalizeRow, isLikelyDuplicate,
 } from "./csvImport.js";
@@ -23,12 +25,18 @@ import {
   detectRecurringExpenses,
 } from "./subscriptions.js";
 import { findDeals, studentUpsell, eligibilityUpsells, matchService } from "./discounts.js";
-import { parseWithGemma, askGemma } from "./gemma.js";
+import { parseWithGemma, askGemma, warmUpGemma, embedText } from "./gemma.js";
 import { buildQaContext } from "./insights.js";
 import { computeNetWorth } from "./networth.js";
 import { BANK_NAMES } from "./bankNames.js";
 
-const { SUPABASE_URL, SUPABASE_ANON_KEY, GEMMA_ENDPOINT, GEMMA_MODEL, DEAL_FINDINGS_ENABLED, PRICE_FINDINGS_ENABLED } = window.APP_CONFIG || {};
+const { SUPABASE_URL, SUPABASE_ANON_KEY, GEMMA_ENDPOINT, GEMMA_MODEL, GEMMA_EMBED_MODEL, GEMMA_AUTH_KEY, DEAL_FINDINGS_ENABLED, PRICE_FINDINGS_ENABLED } = window.APP_CONFIG || {};
+// Ollama's embeddings endpoint, derived from GEMMA_ENDPOINT (the full
+// /api/generate URL) rather than a second config field for a value that's
+// mechanically the same host/port - kept in sync with tools/embed-
+// expenses.js's identical derivation by hand, same category as
+// MARKET_INDEXES. Used only by retrieveRelevantHistory() below.
+const GEMMA_EMBED_ENDPOINT = (GEMMA_ENDPOINT || "").replace(/\/api\/generate$/, "/api/embeddings");
 if (!SUPABASE_URL || SUPABASE_URL.includes("YOUR-PROJECT")) {
   alert("Set your Supabase URL and anon key in config.js (see SETUP.md §4).");
 }
@@ -37,6 +45,9 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // ---- tiny helpers ----------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => "$" + Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// Same numeric formatting as fmt(), no "$" prefix - a market index level
+// (Market overview card) is a points figure, not a dollar amount.
+const fmtNum = (n) => Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 // Every innerHTML template string below interpolates *some* user-typed or
 // scraped/LLM-derived text (an expense description, an asset name, the
 // Investments tab's price-agent-sourced "why" explanation, ...) - wrap
@@ -49,6 +60,30 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
 function toast(msg) {
   const t = $("toast"); t.textContent = msg; t.classList.add("show");
   setTimeout(() => t.classList.remove("show"), 2200);
+}
+// Generic red-border flag for a denied action (the "every denial
+// flags its field" rule) - call right before a `return toast(...)` that
+// rejects a save/action over one or more specific fields. Self-clearing:
+// the border comes off the moment the user next touches that exact field
+// (input or change, whichever fires first), no separate per-form tracking
+// function needed the way REQUIRED_QUICK_ADD_FIELDS/REQUIRED_HOLDING_
+// FIELDS' *live* always-on highlighters are (this is one-shot, not live -
+// those two forms already have live coverage for plain emptiness, so this
+// is what patches the gap for a non-empty-but-invalid value, a cross-field
+// check, or a server-side rejection, everywhere else in the app). Accepts
+// one id or an array, for a denial that's jointly about more than one
+// field. Silently does nothing for an id with no matching element (a
+// field this action isn't clearly about, or a page whose fields aren't
+// mounted in a force-unhide test) rather than throwing.
+function flagField(ids) {
+  for (const id of Array.isArray(ids) ? ids : [ids]) {
+    const el = $(id);
+    if (!el) continue;
+    el.classList.add("field-required");
+    const clear = () => el.classList.remove("field-required");
+    el.addEventListener("input", clear, { once: true });
+    el.addEventListener("change", clear, { once: true });
+  }
 }
 // Promise-based replacement for window.confirm() on destructive actions -
 // resolves true/false, same call shape as confirm() (await it, act on the
@@ -76,10 +111,18 @@ $("confirmModalOk").onclick = () => closeConfirmModal(true);
 const acctLabel = (a) => (a ? (a.bank_name ? `${a.bank_name} ${a.name}` : a.name) : "");
 const acctName = (id) => acctLabel(accounts.find((a) => a.id === id));
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
-// A stable keyword to learn from (first meaningful token of merchant/description).
+// A stable keyword to learn from (first meaningful token of merchant/
+// description). Strips leading/trailing punctuation from each candidate
+// word before the length check - categorize.js now matches keywords as
+// whole words (\b...\b), and a keyword ending in a trailing comma/period
+// picked up from raw typed text ("at walmart, bought milk" -> "walmart,")
+// would never match anything again, since \b's behavior right at a
+// punctuation edge is unreliable, not a silent no-op.
 function learnKeyword(row) {
   const src = (row.merchant || row.description || "").toLowerCase().trim();
-  const tok = src.split(/\s+/).filter((w) => w.length >= 3)[0];
+  const tok = src.split(/\s+/)
+    .map((w) => w.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ""))
+    .filter((w) => w.length >= 3)[0];
   return tok || null;
 }
 
@@ -90,12 +133,13 @@ let subscriptions = []; // cache of the user's subscriptions
 let catalog = [];     // shared subscription_catalog reference data
 let dealFindings = []; // shared, machine-found deals (F6 stretch)
 let assetPriceFindings = []; // shared, machine-found asset prices
+let marketIndexFindings = []; // shared, machine-found market index levels (Investments tab's Market overview)
 let budgets = []; // per-category monthly limits
 let budgetWarnings = []; // this month's budgetStatus() rows at/over WARN_THRESHOLD_PCT
 let investmentTargets = []; // per-bucket allocation targets (Investments tab)
 let assets = [];      // net-worth assets (Log page)
 let debts = [];        // tracked debts, i.e. rows in the `liabilities` table (Log page)
-let accountActivity = []; // non-expense money movements (asset adjust, liability pay) - Recent Transactions
+let accountActivity = []; // non-expense money movements (asset adjust, liability pay) - Recent History
 let editing = null;   // expense row currently in the edit modal
 let editingSub = null; // subscription row currently in the sub form
 let userId = null;    // signed-in user's uuid
@@ -107,7 +151,7 @@ let gemmaTimer = null;      // debounce handle for background parsing
 // ---- AUTH ------------------------------------------------------------------
 $("signInBtn").onclick = async () => {
   const email = $("email").value.trim();
-  if (!email) return toast("Enter your email");
+  if (!email) { flagField("email"); return toast("Enter your email"); }
   $("signInBtn").disabled = true;
   $("signInBtn").textContent = "Sending...";
   $("authMsg").textContent = "Sending magic link...";
@@ -115,6 +159,7 @@ $("signInBtn").onclick = async () => {
   $("signInBtn").disabled = false;
   $("signInBtn").textContent = "Send magic link instead";
   $("authMsg").textContent = error ? error.message : "Link sent ✓ - check your email.";
+  if (error) flagField("email");
   toast(error ? "Couldn't send link" : "Magic link sent ✓");
 };
 // Primary sign-in path (see index.html's authView comment) - completes
@@ -124,8 +169,8 @@ $("signInBtn").onclick = async () => {
 $("passwordSignInBtn").onclick = async () => {
   const email = $("email").value.trim();
   const password = $("password").value;
-  if (!email) return toast("Enter your email");
-  if (!password) return toast("Enter your password");
+  if (!email) { flagField("email"); return toast("Enter your email"); }
+  if (!password) { flagField("password"); return toast("Enter your password"); }
   $("passwordSignInBtn").disabled = true;
   $("passwordSignInBtn").textContent = "Signing in...";
   $("passwordAuthMsg").textContent = "Signing in...";
@@ -133,12 +178,21 @@ $("passwordSignInBtn").onclick = async () => {
   $("passwordSignInBtn").disabled = false;
   $("passwordSignInBtn").textContent = "Sign in";
   $("passwordAuthMsg").textContent = error ? error.message : "";
-  if (error) toast("Couldn't sign in");
+  if (error) { flagField(["email", "password"]); toast("Couldn't sign in"); }
 };
 $("signOutBtn").onclick = async () => { await sb.auth.signOut(); location.reload(); };
 
 sb.auth.onAuthStateChange((_e, session) => renderAuth(session));
 sb.auth.getSession().then(({ data }) => renderAuth(data.session));
+
+// Which tab the user was last on, restored after a reload instead of
+// always landing on Log - localStorage (per-device UI state, not account
+// data, so no RLS/table involved) rather than a URL param, since this is
+// a single-page app with no routing. Falls back to "log" for a missing or
+// unrecognized value (a fresh browser, or a value from some future build
+// this one doesn't know).
+const VIEWS = ["log", "subs", "reports", "invest"];
+const lastView = () => (VIEWS.includes(localStorage.getItem("lastView")) ? localStorage.getItem("lastView") : "log");
 
 function renderAuth(session) {
   const authed = !!session;
@@ -146,7 +200,19 @@ function renderAuth(session) {
   userEmail = session?.user?.email ?? null;
   $("authView").classList.toggle("hidden", authed);
   $("nav").classList.toggle("hidden", !authed);
-  if (authed) { showView("log"); init(); }
+  if (authed) {
+    const view = lastView();
+    showView(view);
+    // The per-tab data each view needs (loadSubscriptions/loadReports/the
+    // Investments renders) only exists once init() finishes - Log itself
+    // needs no extra call since its own cards already self-render as each
+    // of init()'s loadX() calls completes, the same way they always have.
+    init().then(() => {
+      if (view === "subs") loadSubscriptions();
+      else if (view === "reports") loadReports();
+      else if (view === "invest") { renderInvestments(); renderInvestmentsTrend(); renderMarketOverview(); }
+    });
+  }
   else { $("logView").classList.add("hidden"); $("subsView").classList.add("hidden"); $("reportsView").classList.add("hidden"); $("investView").classList.add("hidden"); }
 }
 
@@ -154,11 +220,12 @@ function renderAuth(session) {
 $("navLog").onclick = () => showView("log");
 $("navSubs").onclick = () => { showView("subs"); loadSubscriptions(); };
 $("navReports").onclick = () => { showView("reports"); loadReports(); };
-$("navInvest").onclick = () => { showView("invest"); renderInvestments(); renderInvestmentsTrend(); };
+$("navInvest").onclick = () => { showView("invest"); renderInvestments(); renderInvestmentsTrend(); renderMarketOverview(); };
 $("backFromSubs").onclick = () => showView("log");
 $("backFromReports").onclick = () => showView("log");
 $("backFromInvest").onclick = () => showView("log");
 function showView(v) {
+  localStorage.setItem("lastView", v);
   $("logView").classList.toggle("hidden", v !== "log");
   $("subsView").classList.toggle("hidden", v !== "subs");
   $("reportsView").classList.toggle("hidden", v !== "reports");
@@ -181,7 +248,7 @@ async function init() {
   // liabilities are account-linked (to hide their delete button), so it
   // needs a populated `accounts` to render correctly on first paint.
   await loadAccounts();
-  await Promise.all([loadRules(), loadProfile(), loadCatalog(), loadDealFindings(), loadAssetPriceFindings(), loadAssets(), loadDebts(), loadAccountActivity(), loadBudgets(), loadInvestmentTargets()]);
+  await Promise.all([loadRules(), loadProfile(), loadCatalog(), loadDealFindings(), loadAssetPriceFindings(), loadMarketIndexFindings(), loadAssets(), loadDebts(), loadAccountActivity(), loadBudgets(), loadInvestmentTargets()]);
   await Promise.all([loadExpenses(), loadSubscriptions()]);
   await autoLogDueSubscriptions();
   await snapshotNetWorthIfNeeded();
@@ -206,7 +273,7 @@ async function loadCatalog() {
 }
 
 // F6 stretch - dormant until DEAL_FINDINGS_ENABLED is flipped on (config.js) and
-// the home-machine search agent (tools/deal-agent.js) starts writing rows.
+// the home-machine search agent starts writing rows.
 async function loadDealFindings() {
   if (!DEAL_FINDINGS_ENABLED) { dealFindings = []; return; }
   const { data } = await sb.from("deal_findings").select("*").gt("expires_at", new Date().toISOString());
@@ -225,7 +292,33 @@ async function loadAssetPriceFindings() {
   assetPriceFindings = data || [];
   renderAssetPriceFindings();
 }
-function fillCategorySelect(sel) { sel.innerHTML = CATEGORIES.map((c) => `<option>${c}</option>`).join(""); }
+
+// Same dormant-until-flag shape as loadAssetPriceFindings above, same
+// PRICE_FINDINGS_ENABLED flag (one switch for "is the price-agent
+// pipeline on," not a second flag for what's fundamentally the same
+// pipeline just writing to a different table for a fixed index list).
+async function loadMarketIndexFindings() {
+  if (!PRICE_FINDINGS_ENABLED) { marketIndexFindings = []; renderMarketOverview(); return; }
+  const { data } = await sb.from("market_index_findings").select("*").gt("expires_at", new Date().toISOString());
+  marketIndexFindings = data || [];
+  renderMarketOverview();
+}
+// A blank "None" first option, not just the real categories - so a select
+// that's never been explicitly set (fCategory on a fresh Quick Add) starts
+// genuinely empty rather than silently defaulting to CATEGORIES[0] ("Food")
+// the way an <select> with no blank option always does. That default was
+// masking category as a de-facto optional field: the saveBtn/editSave
+// validation already checked `if (!category) return toast(...)`, but the
+// check could never actually fire since the select could never BE empty.
+// Every caller (fCategory, eCategory, bulkCategorySelect, budgetCategory)
+// already has that same guard, so this one change makes "required" real
+// everywhere at once rather than needing a per-caller fix. eCategory's own
+// `.value = row.category ?? CATEGORIES[0]` (openEdit, below) still
+// explicitly selects a real category for an existing expense regardless -
+// an already-saved expense always has one, so it never lands on "None".
+function fillCategorySelect(sel) {
+  sel.innerHTML = `<option value="">None</option>` + CATEGORIES.map((c) => `<option>${c}</option>`).join("");
+}
 
 async function loadRules() {
   const { data } = await sb.from("category_rules").select("keyword,category");
@@ -234,8 +327,7 @@ async function loadRules() {
 }
 
 // ---- ACCOUNTS --------------------------------------------------------------
-// ~42 account types across 5 categories (Deposit accounts, Credit
-// accounts, Loans, Retirement & investment, Specialty), as a single
+// Every account type as a single
 // data-driven config instead of one hardcoded map per concern - adding a
 // new type later means adding one entry here, not touching five different
 // functions. `kind` decides whether saving this type auto-creates+links a
@@ -267,6 +359,8 @@ const ACCOUNT_TYPES = {
   overdraft_line:         { label: "Overdraft Line of Credit",    category: "Credit accounts",          kind: "liability", linkType: "overdraft_line" },
   bnpl:                   { label: "Buy Now, Pay Later",          category: "Credit accounts",          kind: "liability", linkType: "bnpl" },
 
+  medical_credit_card:    { label: "Medical / Deferred-Interest Card", category: "Credit accounts",     kind: "liability", linkType: "medical_credit_card" },
+
   personal_loan:          { label: "Personal Loan",               category: "Loans",                    kind: "liability", linkType: "personal_loan" },
   auto_loan:              { label: "Auto Loan",                   category: "Loans",                    kind: "liability", linkType: "auto_loan" },
   mortgage:               { label: "Mortgage",                    category: "Loans",                    kind: "liability", linkType: "mortgage" },
@@ -274,15 +368,37 @@ const ACCOUNT_TYPES = {
   student_loan:           { label: "Student Loan",                category: "Loans",                    kind: "liability", linkType: "student_loan" },
   payday_loan:            { label: "Payday Loan",                 category: "Loans",                    kind: "liability", linkType: "payday_loan" },
   title_loan:             { label: "Title Loan",                  category: "Loans",                    kind: "liability", linkType: "title_loan" },
+  credit_builder_loan:    { label: "Credit-Builder Loan",         category: "Loans",                    kind: "liability", linkType: "credit_builder_loan" },
+  retirement_plan_loan:   { label: "Retirement Plan Loan",        category: "Loans",                    kind: "liability", linkType: "retirement_plan_loan" },
 
-  retirement_employer:    { label: "401(k) / 403(b) / 457",       category: "Retirement & investment",  kind: "asset",     linkType: "retirement_employer" },
-  ira:                    { label: "IRA",                         category: "Retirement & investment",  kind: "asset",     linkType: "ira" },
+  // Traditional vs. Roth is the single most consequential split in this
+  // whole table and it is NOT cosmetic: a traditional balance is pre-tax
+  // (a future withdrawal owes income tax, so the number shown overstates
+  // what the money is actually worth) while a Roth balance is post-tax
+  // (qualified withdrawals owe nothing, so the number is what you keep).
+  // Both still count into net worth at face value here - that's the
+  // honest default rather than applying a guessed tax haircut.
+  traditional_401k:       { label: "401(k) (Traditional)",        category: "Retirement & investment",  kind: "asset",     linkType: "traditional_401k" },
+  roth_401k:              { label: "401(k) (Roth)",               category: "Retirement & investment",  kind: "asset",     linkType: "roth_401k" },
+  plan_403b:              { label: "403(b)",                      category: "Retirement & investment",  kind: "asset",     linkType: "plan_403b" },
+  plan_457b:              { label: "457(b)",                      category: "Retirement & investment",  kind: "asset",     linkType: "plan_457b" },
+  traditional_ira:        { label: "Traditional IRA",             category: "Retirement & investment",  kind: "asset",     linkType: "traditional_ira" },
+  roth_ira:               { label: "Roth IRA",                    category: "Retirement & investment",  kind: "asset",     linkType: "roth_ira" },
+  sep_ira:                { label: "SEP IRA",                     category: "Retirement & investment",  kind: "asset",     linkType: "sep_ira" },
+  simple_ira:             { label: "SIMPLE IRA",                  category: "Retirement & investment",  kind: "asset",     linkType: "simple_ira" },
   brokerage:              { label: "Brokerage",                   category: "Retirement & investment",  kind: "asset",     linkType: "brokerage" },
+  espp:                   { label: "Employee Stock Purchase Plan",category: "Retirement & investment",  kind: "asset",     linkType: "espp" },
+  pension:                { label: "Pension (Defined Benefit)",   category: "Retirement & investment",  kind: "asset",     linkType: "pension" },
+  custodial_utma:         { label: "UTMA / UGMA Custodial",       category: "Retirement & investment",  kind: "asset",     linkType: "custodial_utma" },
   plan_529:               { label: "529 Plan",                    category: "Retirement & investment",  kind: "asset",     linkType: "plan_529" },
   tsp:                    { label: "Thrift Savings Plan (TSP)",   category: "Retirement & investment",  kind: "asset",     linkType: "tsp" },
   solo_401k:              { label: "Solo 401(k)",                 category: "Retirement & investment",  kind: "asset",     linkType: "solo_401k" },
   rollover_inherited_ira: { label: "Rollover / Inherited IRA",    category: "Retirement & investment",  kind: "asset",     linkType: "rollover_inherited_ira" },
   annuity:                { label: "Annuity",                     category: "Retirement & investment",  kind: "asset",     linkType: "annuity" },
+  // Superseded by the split-out types above, kept so existing rows still
+  // resolve to a readable label - see LEGACY_ACCOUNT_TYPES.
+  retirement_employer:    { label: "401(k) / 403(b) / 457",       category: "Retirement & investment",  kind: "asset",     linkType: "retirement_employer" },
+  ira:                    { label: "IRA (unspecified)",           category: "Retirement & investment",  kind: "asset",     linkType: "ira" },
 
   hsa:                    { label: "HSA",                         category: "Specialty",                kind: "asset",     linkType: "hsa" },
   fsa:                    { label: "FSA",                         category: "Specialty",                kind: "asset",     linkType: "fsa" },
@@ -298,7 +414,18 @@ const ACCOUNT_TYPES = {
   crypto:                 { label: "Cryptocurrency",              category: "Specialty",                kind: "asset",     linkType: "crypto" },
   multi_currency:         { label: "Multi-Currency Account",      category: "Specialty",                kind: "asset",     linkType: "multi_currency" },
   life_insurance_cash_value: { label: "Life Insurance Cash Value",category: "Specialty",                kind: "asset",     linkType: "life_insurance_cash_value" },
+  trust_account:          { label: "Trust Account",               category: "Specialty",                kind: "asset",     linkType: "trust_account" },
 };
+// Types that predate a finer-grained split and are no longer offered when
+// creating something new, but must stay in ACCOUNT_TYPES so rows already
+// stored against them still render a real label instead of a raw enum
+// value. 'ira' and 'retirement_employer' were single buckets before
+// Traditional/Roth/SEP/SIMPLE and 401(k)/403(b)/457 were split out above -
+// the distinction is a genuine tax difference, not a naming preference, so
+// new accounts should always pick the specific one. Hidden from the
+// pickers only (populateAcctTypeSelect / populateAssetTypeSelect); every
+// other code path treats them normally.
+const LEGACY_ACCOUNT_TYPES = new Set(["ira", "retirement_employer"]);
 const ACCOUNT_CATEGORIES = ["Deposit accounts", "Credit accounts", "Loans", "Retirement & investment", "Specialty"];
 // Per-type, not per-category - "is this realistically an FDIC/NCUA bank or
 // credit union" doesn't follow category lines cleanly. Every Deposit
@@ -359,11 +486,20 @@ const LIABILITY_ACCOUNT_TYPES = new Set(Object.keys(AUTO_LIABILITY_TYPE));
 // of Deposit accounts (except CD, which is locked until maturity) and all
 // of Credit accounts remain spendable - a credit card, HELOC, or even
 // BNPL is still something you'd genuinely select at checkout.
+// A medical/deferred-interest card (CareCredit and friends) is deliberately
+// NOT here - it is a real card you hand over at a clinic or vet, so it
+// belongs in the payment-method pickers exactly like a store card does.
+// Every Retirement & investment type is excluded (you cannot swipe a Roth
+// IRA), as is a trust account - a trustee may well have checkbook access in
+// real life, but it is not this app's user's personal payment method.
 const NON_SPENDABLE_ACCOUNT_TYPES = new Set([
   "cd",
   "personal_loan", "auto_loan", "mortgage", "home_equity_loan", "student_loan", "payday_loan", "title_loan",
-  "retirement_employer", "ira", "brokerage", "plan_529", "tsp", "solo_401k", "rollover_inherited_ira", "annuity",
-  "coverdell_esa", "treasury_direct", "crypto", "life_insurance_cash_value",
+  "credit_builder_loan", "retirement_plan_loan",
+  "retirement_employer", "ira", "traditional_401k", "roth_401k", "plan_403b", "plan_457b",
+  "traditional_ira", "roth_ira", "sep_ira", "simple_ira", "espp", "pension", "custodial_utma",
+  "brokerage", "plan_529", "tsp", "solo_401k", "rollover_inherited_ira", "annuity",
+  "coverdell_esa", "treasury_direct", "crypto", "life_insurance_cash_value", "trust_account",
 ]);
 // Which asset types populate the Investments tab. Derived from
 // ACCOUNT_TYPES' own category grouping (every "Retirement & investment"
@@ -377,28 +513,177 @@ const INVESTMENT_ASSET_TYPES = new Set([
   ...Object.entries(ACCOUNT_TYPES).filter(([, cfg]) => cfg.category === "Retirement & investment").map(([type]) => type),
   "crypto",
 ]);
-// BANK_NAMES (bankNames.js) is ~3,750 real FDIC-insured banks plus a few
+// A fixed set, not free text - the allocation calculator (allocationVsTarget,
+// investments.js) groups an asset/holding's investment_bucket against a
+// investment_targets.bucket by exact string match, so a typo used to create
+// a second, orphaned bucket a target could never match ("Stock" vs
+// "Stocks"). Every picker that sets one of these values (the standalone
+// Assets-card form, a holding, and the Target-allocation form itself) reads
+// from this single list via populateInvestBucketSelects() below, so the
+// three can never drift out of sync with each other. "Other" is the
+// deliberate catch-all for anything not covered by the rest, rather than
+// leaving no option for it.
+const INVESTMENT_BUCKETS = ["Stocks", "Bonds", "Cash", "Crypto", "Real Estate", "Other"];
+// A fixed list of major US indexes for the Investments tab's Market
+// overview card - genuinely NOT derived from anything a user owns, unlike
+// every other Investments config above. Must match tools/price-agent.js's
+// own MARKET_INDEXES constant exactly (same strings, same order isn't
+// required but the strings are what ties a market_index_findings row back
+// to a row here) - that file has no import/export machinery to share this
+// list from a single source, so the two are kept in sync by hand.
+const MARKET_INDEXES = ["S&P 500", "Dow Jones Industrial Average", "NASDAQ Composite", "Russell 2000"];
+// A fixed, curated watchlist of well-known large-cap stocks (not each
+// user's own holdings) so the Investments tab can surface "today's biggest
+// movers" even for a user who holds nothing at all - same "public market
+// data, not tied to any user" category as MARKET_INDEXES above, and
+// deliberately written to the SAME market_index_findings table rather than
+// a new one, since that table's real meaning was always "public market
+// data," not literally "indexes only." Must match tools/price-agent.js's
+// own MARKET_MOVERS_WATCHLIST constant, kept in sync by hand for the same
+// reason MARKET_INDEXES already is. Comprehensive-but-not-exhaustive by
+// design (20 large caps across sectors) - the same honesty caveat as
+// tickers.js/BANK_NAMES: this is a fixed watchlist, not a live scan of
+// "every stock," since there's no $0 feed that could do that.
+const MARKET_MOVERS_WATCHLIST = [
+  "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "UNH",
+  "XOM", "JNJ", "WMT", "PG", "MA", "HD", "DIS", "NFLX", "AMD", "KO",
+];
+// A plain flat list with no dependency on fetched data, unlike
+// populateAcctTypeSelect/populateAssetTypeSelect/populateDebtTypeSelect
+// (which lazily populate on first form-open) - safe to populate once,
+// eagerly, at module load instead of needing a trigger per select.
+// assetInvestBucket/holdingBucket get a blank "Not set" first option since
+// a bucket is optional there (an investment asset can exist outside the
+// allocation calculator entirely); investTargetBucket does not, since
+// setting a target with no bucket chosen isn't a meaningful action.
+function populateInvestBucketSelects() {
+  const opts = INVESTMENT_BUCKETS.map((b) => `<option value="${b}">${b}</option>`).join("");
+  $("assetInvestBucket").innerHTML = `<option value="">Not set</option>${opts}`;
+  $("holdingBucket").innerHTML = `<option value="">Not set</option>${opts}`;
+  $("investTargetBucket").innerHTML = opts;
+}
+populateInvestBucketSelects();
+// BANK_NAMES (bankNames.js) is ~3,570 real FDIC-insured banks plus a few
 // well-known credit unions/brands FDIC doesn't cover - not a hardcoded
-// seed list anymore. isKnownBank() is what actually enforces "type a real
-// bank" (saveAcctBtn below); the datalist (loadAccounts()) is just this
-// same source made pickable instead of typed blind.
+// seed list anymore. isKnownBank() is a soft gate (saveAcctBtn below): a
+// no-match asks for confirmation rather than blocking outright, since the
+// list is comprehensive but not exhaustive - see saveAcctBtn's override.
+// The datalist (rankBankMatches(), just below) is this same source made
+// pickable and ranked instead of typed blind.
 //
 // Matching is deliberately loose, not exact-equals: official FDIC names
 // are legal-entity names ("JPMorgan Chase Bank, National Association"),
 // not brand names ("Chase") - a strict match would reject the name
-// everyone actually uses. One direction only, though - "does a real
-// bank's name contain what was typed" (catches "Chase" inside the legal
-// name, and the full legal name typed verbatim, since a string contains
-// itself). The reverse ("does what was typed contain a real bank's
-// name") looked equally reasonable but isn't safe: FDIC's data includes
-// an institution literally named "BANK", so it matched *any* gibberish
-// that happened to contain the word "bank" - which is most made-up bank
-// names. Caught by testing actual gibberish input before shipping this,
-// not just the happy path.
+// everyone actually uses. Both sides are reduced to the same normalized
+// key first (bankKey), so the legal-entity noise that differs between what
+// FDIC stores and what a person types stops mattering at all.
+//
+// Matching runs in BOTH directions, which the pre-dedup version could not
+// safely do. Forward ("a real bank's name contains what was typed") catches
+// "Chase". Reverse ("what was typed contains a real bank's name") is what
+// keeps the deduplicated list from rejecting real input - BANK_NAMES now
+// holds one canonical spelling per bank, so a charter-specific name typed
+// verbatim ("Wells Fargo Bank South Central") only matches by finding the
+// canonical "Wells Fargo Bank" inside it. The reverse direction was unsafe
+// before purely because FDIC charters an institution literally named
+// "BANK", which matched any made-up name containing that word; those
+// generic-only entries are now dropped from the list outright, and the
+// reverse direction additionally ignores any key that is nothing but
+// generic banking words. Re-tested against real brands, full legal names,
+// small community banks, and constructed gibberish ("Made Up Savings
+// Bank", "Community Bank of Fakeville") before shipping - not just the
+// happy path, which is what caught the original one-direction bug too.
+const BANK_GENERIC_WORDS = new Set([
+  "bank", "banks", "savings", "trust", "national", "first", "state",
+  "community", "federal", "credit", "union", "financial", "of", "and",
+  "the", "company", "co",
+]);
+const bankKey = (s) =>
+  String(s ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^the\b/, " ")
+    .replace(/\b(national association|n a|inc|incorporated|ssb|fsb|llc|ltd|co|company|corporation|corp)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+const bankGenericOnly = (key) => {
+  const tokens = key.split(" ").filter(Boolean);
+  return tokens.length > 0 && tokens.every((t) => BANK_GENERIC_WORDS.has(t));
+};
+// Word-boundary containment, not raw substring - so "American Bank" can't
+// match inside "Pan American Bankers" on a partial word.
+const containsWords = (haystack, needle) => ` ${haystack} `.includes(` ${needle} `);
+const BANK_KEYS = BANK_NAMES.map(bankKey);
+// Only keys distinctive enough to identify a bank on their own are allowed
+// to match in the reverse direction.
+const BANK_REVERSE_KEYS = BANK_KEYS.filter(
+  (k) => k.length >= 8 && k.split(" ").length >= 2 && !bankGenericOnly(k)
+);
+// All ~3,570 FDIC-insured banks plus every bank_name a real account of
+// this user's has ever used - kept as a plain array, not written to the
+// DOM, since dumping all of it into the datalist at once produced the
+// unusable wall of "Capital Bank" / "Capital Bank, National Association" /
+// "Capital City Bank" / ... seen live when typing "capital" (native
+// datalist shows every match, alphabetically, with no ranking or cap).
+// Updated in loadAccounts(); read by rankBankMatches() below.
+let knownBankNames = BANK_NAMES;
+
+// Ranked, capped suggestions for the acctBank datalist - recomputed on
+// every keystroke (see acctBank.oninput) rather than shown as one static
+// list. A match whose normalized key STARTS WITH what was typed ("Chase"
+// typing "chase") ranks above one where a later WORD starts with it
+// ("JPMorgan Chase Bank" typing "chase"), which in turn ranks above a
+// mid-word substring match; ties break toward the shorter, more
+// brand-like spelling. Capped at 25 so the dropdown stays scannable
+// instead of scrolling for a screen and a half.
+function rankBankMatches(query, limit = 25) {
+  const typed = bankKey(query);
+  if (typed.length < 2) return [];
+  const scored = [];
+  for (const name of knownBankNames) {
+    const key = bankKey(name);
+    if (!key.includes(typed)) continue;
+    const words = key.split(" ");
+    const score = key.startsWith(typed) ? 0 : words.some((w) => w.startsWith(typed)) ? 1 : 2;
+    scored.push({ name, score });
+  }
+  scored.sort((a, b) => a.score - b.score || a.name.length - b.name.length || a.name.localeCompare(b.name));
+  return scored.slice(0, limit).map((s) => s.name);
+}
+$("acctBank").oninput = () => {
+  const matches = rankBankMatches($("acctBank").value);
+  $("bankSuggestions").innerHTML = matches.map((b) => `<option value="${esc(b)}"></option>`).join("");
+};
+
 function isKnownBank(name) {
-  const typed = name.trim().toLowerCase();
+  const typed = bankKey(name);
   if (typed.length < 3) return false; // too short to mean anything either way
-  return BANK_NAMES.some((b) => b.toLowerCase().includes(typed));
+  const tokens = typed.split(" ").filter(Boolean);
+  // A lone generic word ("bank") or a very short single token is not a name.
+  if (tokens.length === 1 && (bankGenericOnly(typed) || typed.length < 5)) return false;
+  if (BANK_KEYS.some((k) => containsWords(k, typed))) return true;
+  return BANK_REVERSE_KEYS.some((k) => containsWords(typed, k));
+}
+
+// Exact match, not fuzzy - a ticker is a precise, case-sensitive-in-reality
+// (normalized to uppercase here) code, unlike a bank's legal name, which is
+// why this doesn't need isKnownBank's word-containment logic. Checks
+// CRYPTO_SYMBOLS instead of the security lists specifically for a holding
+// whose parent account is type 'crypto' (tickers.js's header comment
+// explains why a crypto "ticker" isn't a market-issued security symbol and
+// so isn't in the same list). See tickers.js's own header for the honesty
+// caveat this function inherits: a false negative here does not mean the
+// ticker isn't real, only that this hand-curated list doesn't have it -
+// that's exactly why the caller (saveHoldingBtn) always offers a confirm-
+// to-override path rather than a hard block, the same pattern isKnownBank's
+// caller (saveAcctBtn) already established.
+function isKnownTicker(symbol, parentType) {
+  const typed = symbol.trim().toUpperCase();
+  if (!typed) return false;
+  const list = parentType === "crypto" ? CRYPTO_SYMBOLS : ALL_SECURITY_TICKERS;
+  return list.includes(typed);
 }
 
 // With ~40 types across 5 categories, a 3-button toggle (the original
@@ -413,7 +698,7 @@ function populateAcctTypeSelect() {
   const sel = $("acctType");
   sel.innerHTML = ACCOUNT_CATEGORIES.map((cat) => {
     const opts = Object.entries(ACCOUNT_TYPES)
-      .filter(([, cfg]) => cfg.category === cat)
+      .filter(([type, cfg]) => cfg.category === cat && !LEGACY_ACCOUNT_TYPES.has(type))
       .map(([type, cfg]) => `<option value="${type}">${cfg.label}</option>`)
       .join("");
     return `<optgroup label="${cat}">${opts}</optgroup>`;
@@ -433,7 +718,27 @@ function setAcctType(type) {
     : "Institution name (e.g. Fidelity, Affirm, Coinbase)";
 }
 $("acctType").onchange = () => setAcctType($("acctType").value);
+
+// The Accounts card has one "add" panel and three "edit an existing account"
+// panels (adjust an asset balance, adjust what's owed, edit liability
+// details), all of which render inline in the same card. Letting two sit
+// open at once was genuinely confusing: tapping an account circle while the
+// add form was open dropped its edit panel *below* the add form, so the
+// screen showed a half-filled "Adding: Checking" form directly above an
+// unrelated account's balance editor, with no indication which one a tap on
+// Save would act on. Opening any one of them now closes the others, so the
+// card only ever shows a single active form.
+function closeAcctForm() {
+  $("acctForm").classList.add("hidden");
+}
+function closeAccountEditPanels() {
+  closeAssetAdjust();
+  closeDebtBalanceForm();
+  closeDebtDetailsForm();
+}
 $("addAcctBtn").onclick = () => {
+  const opening = $("acctForm").classList.contains("hidden");
+  if (opening) closeAccountEditPanels();
   $("acctForm").classList.toggle("hidden");
   populateAcctTypeSelect();
   setAcctType("debit"); // every fresh open starts from the same visible state
@@ -451,9 +756,20 @@ $("saveAcctBtn").onclick = async () => {
   const type = $("acctType").value;
   const name = ACCOUNT_TYPE_NAME[type];
   const bankLabel = BANK_VALIDATED_TYPES.has(type) ? "Bank" : "Institution";
-  if (!bank_name) return toast(`${bankLabel} name required`);
+  if (!bank_name) { flagField("acctBank"); return toast(`${bankLabel} name required`); }
+  // isKnownBank() checks against ~3,570 real FDIC-insured banks plus a
+  // handful of well-known non-FDIC brands - comprehensive, but genuinely
+  // not exhaustive (a small credit union, a newer neobank, a foreign
+  // bank). A no-match is no longer a hard stop: it's a confirmation, the
+  // same "are you sure" bar as any other deliberate override in this app,
+  // rather than a wall with no way through for someone who typed a real
+  // name we just don't carry.
   if (BANK_VALIDATED_TYPES.has(type) && !isKnownBank(bank_name)) {
-    return toast("Enter a real bank name, or pick one from the list.");
+    const ok = await confirmModal(
+      `"${bank_name}" isn't in our list of FDIC-insured banks and well-known credit unions. If this is a real bank or credit union we're just missing, you can add it as typed.`,
+      { title: "Bank not recognized", confirmLabel: "Add anyway" }
+    );
+    if (!ok) return;
   }
 
   let linked_asset_id = null;
@@ -463,24 +779,34 @@ $("saveAcctBtn").onclick = async () => {
     const { data: newDebt, error: debtErr } = await sb.from("liabilities")
       .insert({ name: bank_name, type: AUTO_LIABILITY_TYPE[type], balance: 0 })
       .select().single();
-    if (debtErr) return toast(debtErr.message);
+    if (debtErr) { flagField("acctBank"); return toast(debtErr.message); }
     linked_liability_id = newDebt.id;
     autoMsg = "Account added - linked to a new $0 balance liability";
   } else if (AUTO_ASSET_TYPE[type]) {
     const { data: newAsset, error: assetErr } = await sb.from("assets")
       .insert({ name: bank_name, type: AUTO_ASSET_TYPE[type], value: 0 })
       .select().single();
-    if (assetErr) return toast(assetErr.message);
+    if (assetErr) { flagField("acctBank"); return toast(assetErr.message); }
     linked_asset_id = newAsset.id;
     autoMsg = "Account added - linked to a new $0 asset, edit its value below";
   }
 
-  const { error } = await sb.from("accounts").insert({ name, bank_name, type, linked_asset_id, linked_liability_id });
-  if (error) return toast(error.message);
+  const { data: newAccount, error } = await sb.from("accounts")
+    .insert({ name, bank_name, type, linked_asset_id, linked_liability_id })
+    .select().single();
+  if (error) { flagField("acctBank"); return toast(error.message); }
+  // Opening an account is the one history entry that moves no money - it's
+  // there so the log can explain where an account came from, rather than a
+  // balance appearing to materialise from nowhere. Amount 0, no undo (see
+  // NON_UNDOABLE_ACTIVITY_KINDS).
+  await logActivity(
+    "account_created", `Opened ${bank_name} ${name}`, 0, undefined, newAccount.id
+  );
   $("acctBank").value = ""; $("acctForm").classList.add("hidden");
   // loadAccounts first - loadDebts reads `accounts` to know which
   // liabilities are now account-linked (hides their delete button).
   await loadAccounts(); await loadAssets(); await loadDebts();
+  renderRecentTransactions(); // surface the account_created row straight away
   toast(autoMsg || "Account added");
 };
 
@@ -494,14 +820,15 @@ function renderAccountsList() {
   // Grouped by bank so a Checking and a Savings at the same bank sit next
   // to each other, rather than wherever creation order happened to put
   // them. Cash has no bank_name, so it's pinned first explicitly instead
-  // of relying on null/empty-string sorting first. Archived accounts sort
-  // last (active-first), same idea as subscriptions' is_active ordering.
-  const sorted = [...accounts].sort((a, b) => {
+  // of relying on null/empty-string sorting first. Archived accounts are
+  // excluded entirely (not sorted last and dimmed, as they used to be) -
+  // see the archived modal below.
+  const sorted = accounts.filter((a) => !a.archived_at).sort((a, b) => {
     if (a.type === "cash") return -1;
     if (b.type === "cash") return 1;
-    return (!!a.archived_at - !!b.archived_at) ||
-      (a.bank_name || "").localeCompare(b.bank_name || "") || a.name.localeCompare(b.name);
+    return (a.bank_name || "").localeCompare(b.bank_name || "") || a.name.localeCompare(b.name);
   });
+  renderArchivedAccounts();
   $("acctList").innerHTML = sorted.length
     ? sorted.map((a, i) => {
         // Bank/cash-type accounts link to an asset (tap opens the asset-adjust
@@ -532,58 +859,43 @@ function renderAccountsList() {
         // on one element isn't valid HTML, and the browser silently drops
         // the second one, so a clickable *and* archived account would
         // otherwise never actually render dimmed.
-        const styleParts = [clickAttr ? "cursor:pointer" : "", a.archived_at ? "opacity:.5" : ""].filter(Boolean);
-        const styleAttr = styleParts.length ? ` style="${styleParts.join(";")}"` : "";
+        const styleAttr = clickAttr ? ` style="cursor:pointer"` : "";
         return `
       <div class="acct-circle-item" ${clickAttr}${styleAttr}>
         <div class="acct-circle" style="background:${ACCT_COLORS[i % ACCT_COLORS.length]}">${a.type === "cash" ? "💵" : esc((bankLabel.trim()[0] || "?").toUpperCase())}</div>
         ${a.type === "cash" ? "" : `<span class="x" data-del-acct="${a.id}">✕</span>`}
         <div class="name">${esc(bankLabel)}</div>
-        <div class="type">${a.name}${a.archived_at ? " (archived)" : ""}</div>
+        <div class="type">${a.name}</div>
         ${balance != null ? `<div class="balance">${a.linked_liability_id ? "Owed " : ""}${fmt(balance)}</div>` : ""}
-        ${a.type === "cash" ? "" : `<div class="muted" data-archive-acct="${a.id}" style="font-size:11px;cursor:pointer;text-decoration:underline;margin-top:2px">${a.archived_at ? "Unarchive" : "Archive"}</div>`}
+        ${a.type === "cash" ? "" : `<div class="muted" data-archive-acct="${a.id}" style="font-size:11px;cursor:pointer;text-decoration:underline;margin-top:2px">Archive</div>`}
       </div>`;
       }).join("")
     : `<p class="muted" style="font-size:13px">No accounts yet.</p>`;
-  // Archive/unarchive - a reversible toggle, unlike delete below. Leaves
-  // the linked asset/liability completely untouched (see
-  // 22_account_archive.sql) - archiving never changes net worth.
+  // Archive - reversible, unlike deleteAccount above. The DB row (archived_
+  // at timestamp only) is all that changes here; the linked asset/liability
+  // itself is left completely untouched (22_account_archive.sql) so
+  // Unarchive can bring back the exact same balance. It DOES change what's
+  // DISPLAYED, though: net worth and every asset/liability listing treat an
+  // archived account as if deleted (topLevelAssets/countableDebts) - see
+  // archivedAccountAssetIds' comment for the reasoning. Only one direction
+  // here now: this list holds active accounts only, so unarchiving lives in
+  // the archived modal instead (renderArchivedAccounts).
   document.querySelectorAll("[data-archive-acct]").forEach((el) => {
     el.onclick = async (ev) => {
       ev.stopPropagation();
-      const acct = accounts.find((a) => a.id === el.dataset.archiveAcct);
-      const archiving = !acct.archived_at;
       const { error } = await sb.from("accounts")
-        .update({ archived_at: archiving ? new Date().toISOString() : null })
+        .update({ archived_at: new Date().toISOString() })
         .eq("id", el.dataset.archiveAcct);
       if (error) return toast(error.message);
       await loadAccounts();
-      toast(archiving ? "Account archived" : "Account unarchived");
+      toast("Account archived");
     };
   });
   // delete handlers - expenses keep their history (account_id -> null on delete, per schema)
   // Cash has no delete affordance - it's auto-managed (ensureCashAccount), use
   // the +/- adjust form instead of removing it.
   document.querySelectorAll("[data-del-acct]").forEach((el) => {
-    el.onclick = async (ev) => {
-      ev.stopPropagation();
-      const acct = accounts.find((a) => a.id === el.dataset.delAcct);
-      // A linked liability or asset is deleted along with its account (DB
-      // triggers, 12_delete_liability_with_account.sql and 13_delete_asset_
-      // with_account.sql) - warn about that up front since it's not obvious
-      // from "delete this account" alone.
-      const msg = acct?.linked_liability_id
-        ? "Existing expenses stay but become unassigned. Its linked liability and tracked balance are deleted too. Consider Archive instead if you want to keep its history."
-        : acct?.linked_asset_id
-        ? "Existing expenses stay but become unassigned. Its linked asset and balance are deleted too. Consider Archive instead if you want to keep its history."
-        : "Existing expenses stay but become unassigned.";
-      if (!(await confirmModal(msg, { title: "Delete this account?" }))) return;
-      const { error } = await sb.from("accounts").delete().eq("id", el.dataset.delAcct);
-      if (error) return toast(error.message);
-      // loadAssets/loadDebts refresh so a deleted linked asset or liability
-      // disappears from its own card too, not just the account from its own.
-      await loadAccounts(); await loadExpenses(); await loadAssets(); await loadDebts(); toast("Account deleted");
-    };
+    el.onclick = async (ev) => { ev.stopPropagation(); await deleteAccount(el.dataset.delAcct); };
   });
   document.querySelectorAll("[data-adjust-acct]").forEach((el) => {
     el.onclick = () => openAssetAdjust(el.dataset.adjustAcct);
@@ -592,6 +904,101 @@ function renderAccountsList() {
     el.onclick = () => openDebtBalanceForm(el.dataset.adjustLiability, "paying");
   });
 }
+
+// Shared by the main Accounts card's "✕" and the Archived-accounts modal's
+// Delete button below - same cascading DB-trigger delete (12_delete_
+// liability_with_account.sql / 13_delete_asset_with_account.sql), same
+// confirmation, same refresh. Unlike archiving, this is permanent: a linked
+// liability or asset is deleted along with the account, and its past
+// expenses are unassigned (account_id -> null on delete, per schema), not
+// preserved the way an archived account's history stays intact. Returns
+// whether the delete actually happened, so a caller that needs to react
+// (none currently do beyond the shared refresh here) can tell a cancel
+// apart from a failure.
+async function deleteAccount(acctId) {
+  const acct = accounts.find((a) => a.id === acctId);
+  const msg = acct?.linked_liability_id
+    ? "Its linked liability and tracked balance are deleted too, and existing expenses become unassigned. This can't be undone."
+    : acct?.linked_asset_id
+    ? "Its linked asset and balance are deleted too, and existing expenses become unassigned. This can't be undone."
+    : "Existing expenses become unassigned. This can't be undone.";
+  const label = acct ? (acct.bank_name || acct.name) : "this account";
+  if (!(await confirmModal(msg, { title: `Delete ${label}?` }))) return false;
+  const { error } = await sb.from("accounts").delete().eq("id", acctId);
+  if (error) { toast(error.message); return false; }
+  // loadAssets/loadDebts refresh so a deleted linked asset or liability
+  // disappears from its own card too, not just the account from its own;
+  // loadAccounts refreshes both the main circle list and the archived
+  // modal (renderAccountsList calls renderArchivedAccounts).
+  await loadAccounts(); await loadExpenses(); await loadAssets(); await loadDebts();
+  toast("Account deleted");
+  return true;
+}
+
+// Archived accounts live only here, behind the Accounts card's "View
+// archived" link - keeping them in the main circle list crowded out the
+// accounts actually in use, since a closed account is never deleted (it's
+// still fully recoverable via Unarchive). Listed as plain rows rather than
+// circles: this is a recovery/cleanup screen, not something to browse, and
+// the actions are Unarchive (bring it back exactly as it was) or Delete
+// (permanent - deleteAccount above).
+//
+// While archived, its linked asset/liability is excluded from every
+// listing and total (Assets/Liabilities cards, net worth, Investments tab -
+// see archivedAccountAssetIds/archivedAccountLiabilityIds) even though the
+// row itself, and every past expense/account_activity referencing this
+// account, stays fully intact - that's the "acts deleted, but recoverable
+// and history-preserving" behavior this whole feature is for. The balance
+// shown here is read directly, bypassing that exclusion, since a recovery
+// screen is exactly where you'd want to see what unarchiving would bring
+// back.
+function renderArchivedAccounts() {
+  const archived = accounts.filter((a) => a.archived_at);
+  const toggle = $("archivedAcctToggle");
+  toggle.classList.toggle("hidden", archived.length === 0);
+  toggle.textContent = `View archived (${archived.length})`;
+  if (!archived.length) {
+    $("archivedAcctModal").classList.add("hidden"); // last one unarchived while open
+    return;
+  }
+  $("archivedAcctList").innerHTML = archived
+    .sort((a, b) => (a.bank_name || "").localeCompare(b.bank_name || "") || a.name.localeCompare(b.name))
+    .map((a) => {
+      const balance = a.linked_asset_id
+        ? assets.find((x) => x.id === a.linked_asset_id)?.value
+        : a.linked_liability_id
+        ? debts.find((x) => x.id === a.linked_liability_id)?.balance
+        : null;
+      return `
+      <div class="exp" style="cursor:default">
+        <div>
+          <div>${esc(a.bank_name || a.name)}</div>
+          <div class="meta">${esc(a.name)}${balance != null ? ` · ${a.linked_liability_id ? "Owed " : ""}${fmt(balance)}` : ""}</div>
+        </div>
+        <span class="amt">
+          <button class="secondary" data-unarchive-acct="${a.id}" style="width:auto;padding:4px 10px;font-size:12px;margin-right:6px">Unarchive</button>
+          <button class="secondary" data-delete-archived-acct="${a.id}" style="width:auto;padding:4px 10px;font-size:12px;color:var(--err);border-color:var(--err)">Delete</button>
+        </span>
+      </div>`;
+    }).join("");
+  document.querySelectorAll("[data-unarchive-acct]").forEach((el) => {
+    el.onclick = async () => {
+      const { error } = await sb.from("accounts").update({ archived_at: null }).eq("id", el.dataset.unarchiveAcct);
+      if (error) return toast(error.message);
+      await loadAccounts();
+      toast("Account unarchived");
+    };
+  });
+  // deleteAccount() already refreshes and re-renders this list (via
+  // loadAccounts -> renderAccountsList -> renderArchivedAccounts), and
+  // closes the modal itself once the archived list is empty - no extra
+  // handling needed here beyond triggering the shared delete.
+  document.querySelectorAll("[data-delete-archived-acct]").forEach((el) => {
+    el.onclick = async () => { await deleteAccount(el.dataset.deleteArchivedAcct); };
+  });
+}
+$("archivedAcctToggle").onclick = () => $("archivedAcctModal").classList.remove("hidden");
+$("archivedAcctClose").onclick = () => $("archivedAcctModal").classList.add("hidden");
 
 async function loadAccounts() {
   const { data } = await sb.from("accounts").select("*").order("created_at");
@@ -609,13 +1016,17 @@ async function loadAccounts() {
   $("fAccount").innerHTML = opts;
   $("eAccount").innerHTML = opts;
   $("sAccount").innerHTML = opts;
-  const bankNames = [...new Set([...BANK_NAMES, ...accounts.map((a) => a.bank_name).filter(Boolean)])].sort();
-  $("bankSuggestions").innerHTML = bankNames.map((b) => `<option value="${esc(b)}"></option>`).join("");
+  // A previously-typed bank_name (including one added via the "not
+  // recognized, add anyway" override in saveAcctBtn) becomes just as
+  // suggestable as a seeded FDIC name next time - rankBankMatches reads
+  // this, the datalist itself is populated per-keystroke, not here.
+  knownBankNames = [...new Set([...BANK_NAMES, ...accounts.map((a) => a.bank_name).filter(Boolean)])];
+  $("bankSuggestions").innerHTML = "";
   populateTxnTypeFilter();
   populateTxnAccountFilter();
 }
 
-// Shared by all four Recent Transactions filters below - rebuilds a
+// Shared by all four Recent History filters below - rebuilds a
 // <select>'s options and restores whatever was selected before, if it's
 // still a valid choice, rather than silently resetting the filter back to
 // "All ..." every time the underlying data reloads (e.g. after adding an
@@ -676,7 +1087,8 @@ function populateAssetTypeSelect() {
   sel.dataset.populated = "1";
   for (const cat of STANDALONE_ONLY_ASSET_CATEGORIES) {
     const opts = Object.entries(ACCOUNT_TYPES)
-      .filter(([type, cfg]) => cfg.category === cat && cfg.kind === "asset" && !ACCOUNT_ONLY_SPECIALTY_TYPES.has(type))
+      .filter(([type, cfg]) => cfg.category === cat && cfg.kind === "asset" &&
+        !ACCOUNT_ONLY_SPECIALTY_TYPES.has(type) && !LEGACY_ACCOUNT_TYPES.has(type))
       .map(([type, cfg]) => `<option value="${cfg.linkType}">${cfg.label}</option>`)
       .join("");
     sel.insertAdjacentHTML("beforeend", `<optgroup label="${cat}">${opts}</optgroup>`);
@@ -741,10 +1153,10 @@ $("saveAssetBtn").onclick = async () => {
   const name = $("assetName").value.trim();
   const type = $("assetType").value;
   const value = parseFloat($("assetValue").value);
-  if (!name) return toast("Asset name required");
-  if (!Number.isFinite(value)) return toast("Enter a value");
-  if (type === "cash") return toast("Cash is automatic - use the Cash account's +/- panel instead.");
-  if (type === "bank") return toast("Bank assets come from a Checking account - add one in the Accounts card instead.");
+  if (!name) { flagField("assetName"); return toast("Asset name required"); }
+  if (!Number.isFinite(value)) { flagField("assetValue"); return toast("Enter a value"); }
+  if (type === "cash") { flagField("assetType"); return toast("Cash is automatic - use the Cash account's +/- panel instead."); }
+  if (type === "bank") { flagField("assetType"); return toast("Bank assets come from a Checking account - add one in the Accounts card instead."); }
 
   const isVehicle = type === "vehicle";
   const isInvestment = INVESTMENT_ASSET_TYPES.has(type);
@@ -766,7 +1178,7 @@ $("saveAssetBtn").onclick = async () => {
     ? sb.from("assets").update(row).eq("id", editingAsset.id)
     : sb.from("assets").insert(row);
   const { error } = await q;
-  if (error) return toast(error.message);
+  if (error) { flagField("assetName"); return toast(error.message); }
   const wasEditing = !!editingAsset;
   closeAssetForm();
   await loadAssets(); toast(wasEditing ? "Asset updated" : "Asset added");
@@ -777,8 +1189,9 @@ $("saveAssetBtn").onclick = async () => {
 // math; those two are generic day-delta helpers, not actually
 // subscription-specific despite living in that file.
 function upcomingMaturities(withinDays = 30, today = new Date()) {
+  const hidden = archivedAccountAssetIds();
   return assets
-    .filter((a) => a.type === "cd" && a.maturity_date)
+    .filter((a) => a.type === "cd" && a.maturity_date && !hidden.has(a.id))
     .map((a) => ({ ...a, days: daysUntil(a.maturity_date, today) }))
     .filter((a) => a.days !== null && a.days <= withinDays)
     .sort((a, b) => a.days - b.days);
@@ -795,12 +1208,84 @@ function upcomingMaturities(withinDays = 30, today = new Date()) {
 // 25_touch_updated_at_trigger.sql - before that migration it was
 // permanently stuck at creation time regardless of later edits.
 function staleAssets(monthsThreshold = 6, today = new Date()) {
+  const hidden = archivedAccountAssetIds();
   return assets
-    .filter((a) => a.type !== "cash" && a.type !== "bank" && a.updated_at)
+    .filter((a) => a.type !== "cash" && a.type !== "bank" && a.updated_at && !hidden.has(a.id))
     .filter((a) => !(a.type === "vehicle" && estimateValue(a.purchase_price, a.purchase_date, a.depreciation_rate) !== null))
     .map((a) => ({ ...a, monthsSince: Math.floor((today - new Date(a.updated_at)) / (30.44 * 86400000)) }))
     .filter((a) => a.monthsSince >= monthsThreshold)
     .sort((a, b) => b.monthsSince - a.monthsSince);
+}
+
+// An archived account is treated as functionally deleted everywhere assets
+// or liabilities are LISTED or SUMMED (Assets/Liabilities cards, net worth,
+// Investments tab), while its linked asset/liability row - and every
+// expense/account_activity row that references the account - stays in the
+// database exactly as it was. That's the difference from an actual delete:
+// archiving is reversible (Unarchive brings back the same balance, unlike a
+// real delete's DB-trigger cascade), and history stays fully resolvable
+// (acctName() etc. read the raw `accounts` array, unfiltered by archived
+// status, on purpose). Reversed 2026-08-12 at explicit user request - see
+// 22_account_archive.sql's original "archiving never changes net worth"
+// comment, which this supersedes.
+//
+// A lookup by a specific known id (undo, editing a history row's label,
+// Pay/Edit-details reached from a form already open on that row)
+// deliberately does NOT filter through these - those operate on a row the
+// user is already looking at or a past transaction that must stay
+// resolvable regardless of the account's current archived state. Only the
+// listing/summing call sites below do.
+function archivedAccountAssetIds() {
+  const archivedParents = new Set(
+    accounts.filter((a) => a.archived_at && a.linked_asset_id).map((a) => a.linked_asset_id)
+  );
+  // A holding nested inside an archived parent (40_asset_holdings.sql) has
+  // no linked_asset_id of its own - hidden via its parent's id here, not a
+  // separate check, so archiving hides the whole position list at once,
+  // not just the summary line.
+  const ids = new Set(archivedParents);
+  for (const a of assets) if (a.parent_asset_id && archivedParents.has(a.parent_asset_id)) ids.add(a.id);
+  return ids;
+}
+function archivedAccountLiabilityIds() {
+  return new Set(accounts.filter((a) => a.archived_at && a.linked_liability_id).map((a) => a.linked_liability_id));
+}
+// The liabilities-table counterpart to topLevelAssets, below - every
+// summing/listing call site (net worth, the Liabilities card) goes through
+// this.
+function countableDebts() {
+  const hidden = archivedAccountLiabilityIds();
+  return debts.filter((d) => !hidden.has(d.id));
+}
+
+// Assets that stand on their own, i.e. everything except per-ticker holdings
+// nested inside an investment account (40_asset_holdings.sql). A holding's
+// value belongs to its parent account and is counted there, so anywhere that
+// totals or lists "your assets" must go through this rather than the raw
+// `assets` array - net worth, the Assets card, and the snapshot writer all
+// do. The Investments tab is the deliberate exception: it wants the
+// individual positions, which is the entire point of the tab. Also drops
+// anything belonging to an archived account - see archivedAccountAssetIds
+// above.
+function topLevelAssets() {
+  const hidden = archivedAccountAssetIds();
+  return assets.filter((a) => !a.parent_asset_id && !hidden.has(a.id));
+}
+// Holdings roll up: an investment account is worth the sum of the positions
+// inside it. Written back to the parent's own `value` rather than computed
+// on the fly so that every existing reader (the account circle's balance
+// line, net worth, the trend snapshots, the Assets card) keeps working off
+// the same single column it always has, with no idea holdings exist.
+async function syncParentAssetValue(parentAssetId) {
+  if (!parentAssetId) return;
+  const holdings = assets.filter((a) => a.parent_asset_id === parentAssetId);
+  if (!holdings.length) return; // last holding removed - leave the manual value alone
+  const priced = investmentHoldings(holdings, assetPriceFindings);
+  const total = holdings.reduce((sum, h) => {
+    const live = priced.find((p) => p.asset.id === h.id);
+    return sum + (live ? live.currentValue : Number(h.value || 0));
+  }, 0);
+  await sb.from("assets").update({ value: Math.round(total * 100) / 100 }).eq("id", parentAssetId);
 }
 
 async function loadAssets() {
@@ -820,8 +1305,9 @@ async function loadAssets() {
   // amount is the live depreciation estimate for a vehicle with full
   // purchase info (effectiveAssetValue, depreciation.js), not the stored
   // value - every other asset type is unaffected.
-  $("assetsList").innerHTML = assets.length
-    ? assets.map((a) => `
+  const listedAssets = topLevelAssets(); // holdings show on the Investments tab, not here
+  $("assetsList").innerHTML = listedAssets.length
+    ? listedAssets.map((a) => `
       <div class="exp" ${linkedAssetIds.has(a.id) ? "" : `data-edit-asset="${a.id}" style="cursor:pointer"`}>
         <div>${a.type === "cash" ? "" : `<div class="meta">${assetTypeLabel(a.type)}</div>`}${esc(a.name)}</div>
         <span class="amt">${fmt(effectiveAssetValue(a))}${linkedAssetIds.has(a.id) ? "" : `<span class="x" data-del-asset="${a.id}" style="margin-left:8px">✕</span>`}</span>
@@ -835,7 +1321,9 @@ async function loadAssets() {
   // asset with no account behind it) - every transaction links to a
   // specific account, this form included. If that leaves nothing to pick,
   // the Pay button below still catches it with an explicit error.
-  const payableAssets = assets.filter((a) => linkedAssetIds.has(a.id));
+  // listedAssets already excludes an archived account's asset (topLevelAssets)
+  // - you can't pay a liability down from an account that's been archived.
+  const payableAssets = listedAssets.filter((a) => linkedAssetIds.has(a.id));
   $("payFromAsset").innerHTML = payableAssets.length
     ? payableAssets.map((a) => `<option value="${a.id}">${esc(a.name)} (${fmt(a.value)})</option>`).join("")
     : `<option value="">No linked account available</option>`;
@@ -996,7 +1484,7 @@ async function applyLiabilityDelta(accountId, paymentType, amount, sign) {
 }
 
 // ---- ACCOUNT ACTIVITY (non-expense money movements) ---------------------
-// Expenses already show up in Recent Transactions since they're rows in
+// Expenses already show up in Recent History since they're rows in
 // `expenses`. Everything else that moves money around - a manual asset
 // balance adjustment, paying down a liability - has no row anywhere, so it
 // never appeared there. This is a separate, append-only log just for that,
@@ -1010,7 +1498,18 @@ async function applyLiabilityDelta(accountId, paymentType, amount, sign) {
 // impossible to undo correctly. liability_payment's amount is always
 // positive - a payment only ever moves money one direction (out of the
 // asset, off the liability), so there's no sign to lose there.
-const ACTIVITY_LABEL = { asset_adjust: "Balance update", liability_payment: "Debt payment" };
+const ACTIVITY_LABEL = {
+  asset_adjust: "Balance update",
+  liability_payment: "Debt payment",
+  owed_adjust: "Owed correction",
+  account_created: "Account opened",
+  contribution: "Contribution",
+};
+// The one activity kind that moves no money and so has nothing to reverse -
+// "undoing" it would mean deleting the account, which is what the Accounts
+// card's own delete button is for. renderExpenseList checks this to decide
+// whether a row gets an undo affordance at all.
+const NON_UNDOABLE_ACTIVITY_KINDS = new Set(["account_created"]);
 
 async function loadAccountActivity() {
   const since = lastMonths(12)[0] + "-01";
@@ -1021,7 +1520,7 @@ async function loadAccountActivity() {
 }
 
 // accountId is the account whose own balance changed (required, so this
-// always shows up when filtering Recent Transactions by that account -
+// always shows up when filtering Recent History by that account -
 // omitting it was a real bug caught live: adjusting Cash's balance didn't
 // show up when filtering by the Cash account, since nothing recorded
 // which account it was). relatedAccountId is only for a liability_payment
@@ -1030,12 +1529,20 @@ async function loadAccountActivity() {
 // the money came from. liabilityId is the liability actually paid down -
 // needed for undoActivity() to find a STANDALONE liability (no linked
 // account, so relatedAccountId is null for it) well enough to reverse it.
-async function logActivity(kind, description, amount, occurred_at, accountId, relatedAccountId = null, liabilityId = null) {
+// assetId (trailing, optional) is for 'contribution' rows specifically -
+// most investment assets are standalone (STANDALONE_ONLY_ASSET_CATEGORIES),
+// no linked account at all, so accountId alone can't say WHICH investment
+// asset a contribution belongs to. See 42_contribution_tracking.sql.
+async function logActivity(kind, description, amount, occurred_at, accountId, relatedAccountId = null, liabilityId = null, assetId = null) {
   const rounded = Math.round(Number(amount) * 100) / 100;
-  if (!rounded) return; // no actual change (e.g. "set" to the same value) - nothing to log
+  // A zero amount normally means nothing actually changed (a "set" to the
+  // same value), so there is nothing worth a history row. account_created is
+  // the deliberate exception - it is an audit breadcrumb, not a money
+  // movement, so its amount is always 0 and it must still be recorded.
+  if (!rounded && kind !== "account_created") return;
   const { error } = await sb.from("account_activity").insert({
     kind, description, amount: rounded, occurred_at: occurred_at || new Date().toISOString().slice(0, 10),
-    account_id: accountId, related_account_id: relatedAccountId, liability_id: liabilityId,
+    account_id: accountId, related_account_id: relatedAccountId, liability_id: liabilityId, asset_id: assetId,
   });
   if (!error) await loadAccountActivity();
 }
@@ -1078,6 +1585,7 @@ function openAssetAdjust(accountId) {
     adjustingAccountId = null;
     return;
   }
+  closeAcctForm(); // never leave the add-account panel stacked behind this
   adjustingAssetId = asset.id;
   adjustingAccountId = accountId;
   $("adjustAssetLabel").textContent = asset.name;
@@ -1093,12 +1601,12 @@ function openAssetAdjust(accountId) {
 
 $("adjustAddBtn").onclick = async () => {
   const amount = parseFloat($("adjustAmount").value);
-  if (!amount || amount <= 0) return toast("Enter a valid amount");
+  if (!amount || amount <= 0) { flagField("adjustAmount"); return toast("Enter a valid amount"); }
   const asset = assets.find((a) => a.id === adjustingAssetId);
   if (!asset) return;
   const newValue = Math.round((Number(asset.value) + amount) * 100) / 100;
   const { error } = await sb.from("assets").update({ value: newValue }).eq("id", asset.id);
-  if (error) return toast(error.message);
+  if (error) { flagField("adjustAmount"); return toast(error.message); }
   $("adjustAmount").value = "";
   await logActivity("asset_adjust", `Added ${fmt(amount)} to ${asset.name}`, amount, undefined, adjustingAccountId);
   await loadAssets(); renderRecentTransactions(); closeAssetAdjust(); toast("Added");
@@ -1106,13 +1614,13 @@ $("adjustAddBtn").onclick = async () => {
 
 $("adjustSubtractBtn").onclick = async () => {
   const amount = parseFloat($("adjustAmount").value);
-  if (!amount || amount <= 0) return toast("Enter a valid amount");
+  if (!amount || amount <= 0) { flagField("adjustAmount"); return toast("Enter a valid amount"); }
   const asset = assets.find((a) => a.id === adjustingAssetId);
   if (!asset) return;
-  if (amount > Number(asset.value)) return toast("Balance can't go negative - not enough in " + asset.name);
+  if (amount > Number(asset.value)) { flagField("adjustAmount"); return toast("Balance can't go negative - not enough in " + asset.name); }
   const newValue = Math.round((Number(asset.value) - amount) * 100) / 100;
   const { error } = await sb.from("assets").update({ value: newValue }).eq("id", asset.id);
-  if (error) return toast(error.message);
+  if (error) { flagField("adjustAmount"); return toast(error.message); }
   $("adjustAmount").value = "";
   await logActivity("asset_adjust", `Subtracted ${fmt(amount)} from ${asset.name}`, -amount, undefined, adjustingAccountId);
   await loadAssets(); renderRecentTransactions(); closeAssetAdjust(); toast("Subtracted");
@@ -1120,14 +1628,14 @@ $("adjustSubtractBtn").onclick = async () => {
 
 $("adjustSetBtn").onclick = async () => {
   const newValue = parseFloat($("adjustNewBalance").value);
-  if (!Number.isFinite(newValue)) return toast("Enter a valid balance");
-  if (newValue < 0) return toast("Balance can't go negative");
+  if (!Number.isFinite(newValue)) { flagField("adjustNewBalance"); return toast("Enter a valid balance"); }
+  if (newValue < 0) { flagField("adjustNewBalance"); return toast("Balance can't go negative"); }
   const asset = assets.find((a) => a.id === adjustingAssetId);
   if (!asset) return;
   const rounded = Math.round(newValue * 100) / 100;
   const oldValue = Number(asset.value);
   const { error } = await sb.from("assets").update({ value: rounded }).eq("id", asset.id);
-  if (error) return toast(error.message);
+  if (error) { flagField("adjustNewBalance"); return toast(error.message); }
   await logActivity("asset_adjust", `Set ${asset.name} balance to ${fmt(rounded)}`, rounded - oldValue, undefined, adjustingAccountId);
   await loadAssets(); renderRecentTransactions(); closeAssetAdjust(); toast("Balance updated");
 };
@@ -1140,7 +1648,7 @@ $("adjustMaturitySaveBtn").onclick = async () => {
   if (!adjustingAssetId) return;
   const maturity_date = $("adjustMaturityDate").value || null;
   const { error } = await sb.from("assets").update({ maturity_date }).eq("id", adjustingAssetId);
-  if (error) return toast(error.message);
+  if (error) { flagField("adjustMaturityDate"); return toast(error.message); }
   await loadAssets();
   toast("Maturity date saved");
 };
@@ -1166,8 +1674,8 @@ $("saveDebtBtn").onclick = async () => {
   const name = $("debtName").value.trim();
   const type = $("debtType").value;
   const balance = parseFloat($("debtBalance").value);
-  if (!name) return toast("Liability name required");
-  if (!Number.isFinite(balance)) return toast("Enter a balance");
+  if (!name) { flagField("debtName"); return toast("Liability name required"); }
+  if (!Number.isFinite(balance)) { flagField("debtBalance"); return toast("Enter a balance"); }
   const row = {
     name, type, balance,
     interest_rate: $("debtRate").value ? parseFloat($("debtRate").value) : null,
@@ -1175,7 +1683,7 @@ $("saveDebtBtn").onclick = async () => {
     due_date: $("debtDue").value || null,
   };
   const { error } = await sb.from("liabilities").insert(row);
-  if (error) return toast(error.message);
+  if (error) { flagField("debtName"); return toast(error.message); }
   $("debtName").value = ""; $("debtBalance").value = ""; $("debtRate").value = "";
   $("debtMinPay").value = ""; $("debtDue").value = ""; $("debtForm").classList.add("hidden");
   await loadDebts(); toast("Liability added");
@@ -1190,6 +1698,37 @@ for (const cfg of Object.values(ACCOUNT_TYPES)) {
   if (cfg.kind === "liability") DEBT_TYPE_LABEL[cfg.linkType] = cfg.label;
 }
 DEBT_TYPE_LABEL.credit_card = "Credit"; // shorter than ACCOUNT_TYPES' "Credit Card" - fits the existing card layout better
+
+// Liability types with a real grace period - the ones where paying the
+// statement balance in full by the due date means no interest at all, which
+// is what creditCycle.js's math assumes. A HELOC, personal line of credit or
+// overdraft line is deliberately excluded: those accrue interest from the day
+// they are drawn, with no grace period to lose, so showing a "pay in full to
+// avoid interest" status against them would state something untrue. BNPL is
+// excluded for the same reason from the other direction - a typical pay-in-4
+// plan has its own fixed instalment schedule rather than a revolving cycle.
+// Per-type, not per-category, same rule as BANK_VALIDATED_TYPES.
+const GRACE_PERIOD_LIABILITY_TYPES = new Set([
+  "credit_card", "charge_card", "secured_credit_card", "store_card", "medical_credit_card",
+]);
+
+// Liability types where "credit limit" is a real, revolving ceiling the
+// balance sits against - what credit utilization (balance / limit) is
+// computed from below. Deliberately NOT the same set as
+// GRACE_PERIOD_LIABILITY_TYPES: a HELOC/personal line of credit/overdraft
+// line has no grace period (interest above) but absolutely has a credit
+// limit, while a charge card has a grace period but, by definition, no
+// preset spending limit at all ("no preset spending limit" is the
+// traditional charge card's whole distinguishing feature) - so it's
+// excluded here for the opposite reason it's included there. BNPL is
+// excluded too: a pay-in-4 plan has a fixed installment amount for that one
+// purchase, not a revolving limit you utilize a percentage of. Per-type,
+// not per-category, same rule as BANK_VALIDATED_TYPES/GRACE_PERIOD_
+// LIABILITY_TYPES above.
+const CREDIT_LIMIT_LIABILITY_TYPES = new Set([
+  "credit_card", "secured_credit_card", "store_card", "medical_credit_card",
+  "personal_line_of_credit", "heloc", "overdraft_line",
+]);
 
 // The phase is always derived from today vs draw_period_end, never stored
 // as its own enum - see 28_heloc_draw_period.sql. null (not a HELOC, or a
@@ -1228,6 +1767,44 @@ async function loadDebts() {
     if (p.months <= 0) return "";
     return `<div class="meta">Payoff in ${p.months}mo (${p.payoffDate}) · ${fmt(p.totalInterest)} interest</div>`;
   };
+  // Plain balance/limit math, no judgment attached - shown once both are
+  // set (CREDIT_LIMIT_LIABILITY_TYPES), same "stored but unused until now"
+  // shape as interest_rate/minimum_payment above. Deliberately no color
+  // threshold or "aim for under 30%" framing: that's a real, commonly-cited
+  // credit-scoring guideline, but stating it here would edge from "show the
+  // math" into advice, the same line the Investments tab's allocation
+  // calculator already refuses to cross for what to buy.
+  const utilizationLine = (d) => {
+    if (!CREDIT_LIMIT_LIABILITY_TYPES.has(d.type) || d.credit_limit == null || !d.credit_limit) return "";
+    const pct = Math.round((Number(d.balance) / Number(d.credit_limit)) * 100);
+    return `<div class="meta">${fmt(d.balance)} of ${fmt(d.credit_limit)} limit used (${pct}%)</div>`;
+  };
+  // The plain-language version of creditCycle.js's three end-of-cycle
+  // outcomes. Deliberately explicit that paying the minimum does not stop
+  // interest - that misunderstanding is the whole reason this exists, so the
+  // wording says so outright rather than just showing a number.
+  const cycleLine = (d) => {
+    if (!GRACE_PERIOD_LIABILITY_TYPES.has(d.type)) return "";
+    const s = cycleStatus(d, accountActivity);
+    if (s.state === "no_cycle") return "";
+    if (s.state === "no_statement") {
+      return `<div class="meta">Statement due ${s.dueDate} - add a statement balance in Edit details to track interest</div>`;
+    }
+    const interest = s.interestEstimate != null
+      ? ` Interest so far about ${fmt(s.interestEstimate)}/mo at ${d.interest_rate}% APR.` : "";
+    const logBtn = s.interestEstimate
+      ? `<span class="muted" data-log-interest="${d.id}" style="font-size:11px;cursor:pointer;text-decoration:underline;margin-left:6px">Log interest charge</span>` : "";
+    if (s.state === "paid_in_full") {
+      return `<div class="meta" style="color:var(--ok)">Statement paid in full - no interest this cycle</div>`;
+    }
+    if (s.state === "due_soon") {
+      return `<div class="meta">${fmt(s.remaining)} of the ${fmt(s.statementBalance)} statement still unpaid, due ${s.dueDate} (${s.daysUntilDue}d). Pay it all to avoid interest.</div>`;
+    }
+    if (s.state === "carrying_balance") {
+      return `<div class="meta" style="color:var(--err)">Carrying ${fmt(s.remaining)} past the ${s.dueDate} due date - interest applies even though the minimum was paid.${interest}${logBtn}</div>`;
+    }
+    return `<div class="meta" style="color:var(--err)">Under the ${fmt(s.minimum)} minimum by the ${s.dueDate} due date - interest applies and a late fee is likely.${interest}${logBtn}</div>`;
+  };
   const rowHtml = (d) => {
     const heloc = helocPhaseInfo(d);
     return `
@@ -1237,6 +1814,8 @@ async function loadDebts() {
         ${d.due_date ? `<div class="meta">due ${d.due_date}</div>` : ""}
         ${heloc ? `<div class="meta">${heloc.label}</div>` : ""}
         ${heloc?.phase === "draw" ? "" : payoffLine(d)}
+        ${utilizationLine(d)}
+        ${cycleLine(d)}
         <div class="muted" data-edit-debt="${d.id}" style="font-size:11px;cursor:pointer;text-decoration:underline;margin-top:2px">Edit details</div>
       </div>
       <span class="amt">
@@ -1246,8 +1825,13 @@ async function loadDebts() {
       </span>
     </div>`;
   };
-  const creditDebts = debts.filter((d) => linkedDebtIds.has(d.id));
-  const otherDebts = debts.filter((d) => !linkedDebtIds.has(d.id));
+  // An archived credit account's liability disappears from this card
+  // entirely, same as a real delete would - countableDebts() drops it. A
+  // standalone liability (otherDebts) is never affected, since archiving is
+  // account-scoped and a standalone liability has no account to archive.
+  const visibleDebts = countableDebts();
+  const creditDebts = visibleDebts.filter((d) => linkedDebtIds.has(d.id));
+  const otherDebts = visibleDebts.filter((d) => !linkedDebtIds.has(d.id));
   $("creditDebtsList").innerHTML = creditDebts.length
     ? creditDebts.map(rowHtml).join("")
     : `<p class="muted" style="font-size:13px">No credit accounts yet.</p>`;
@@ -1273,23 +1857,71 @@ async function loadDebts() {
   document.querySelectorAll("[data-edit-debt]").forEach((el) => {
     el.onclick = (ev) => { ev.stopPropagation(); openDebtDetailsForm(debts.find((d) => d.id === el.dataset.editDebt)); };
   });
+  // Never automatic. An interest charge is real money added to what is owed,
+  // so it goes through the same confirm-then-log path a person would use for
+  // any other charge, lands in the history as an undoable row, and shows the
+  // exact figure before it is applied. Auto-accruing it on a timer was
+  // considered and rejected: nothing here runs on a schedule (static PWA, no
+  // server), so a "monthly" job would actually fire whenever the app happened
+  // to be opened, silently double-charging or skipping months.
+  document.querySelectorAll("[data-log-interest]").forEach((el) => {
+    el.onclick = async (ev) => {
+      ev.stopPropagation();
+      const debt = debts.find((d) => d.id === el.dataset.logInterest);
+      if (!debt) return;
+      const s = cycleStatus(debt, accountActivity);
+      if (!s.interestEstimate) return toast("No interest to log for this cycle");
+      const ok = await confirmModal(
+        `Adds ${fmt(s.interestEstimate)} of interest to ${debt.name}, based on ${fmt(s.remaining)} unpaid at ${debt.interest_rate}% APR. This is an estimate - a real issuer uses your average daily balance, so check your statement for the exact figure.`,
+        { title: "Log this interest charge?", confirmLabel: "Add charge" }
+      );
+      if (!ok) return;
+      const newBalance = Math.round((Number(debt.balance) + s.interestEstimate) * 100) / 100;
+      const { error } = await sb.from("liabilities").update({ balance: newBalance }).eq("id", debt.id);
+      if (error) return toast(error.message);
+      const debtAccountId = accounts.find((a) => a.linked_liability_id === debt.id)?.id ?? null;
+      await logActivity(
+        "owed_adjust", `Interest charge on ${debt.name} (${debt.interest_rate}% APR)`,
+        s.interestEstimate, undefined, debtAccountId, null, debt.id
+      );
+      await loadDebts();
+      renderRecentTransactions();
+      toast("Interest charge logged");
+    };
+  });
   renderNetWorth();
   renderAccountsList(); // a changed liability balance may be a linked account's balance line
 }
 
 // Interest rate / minimum payment / due date / draw period end - never
 // balance, which stays strictly driven by real expenses/payments against
-// the liability regardless of type. Works for both a standalone
-// liability and an account-linked one (a
+// the liability regardless of type.
+// Works for both a standalone liability and an account-linked one (a
 // credit card or HELOC never goes through debtForm above at all, so this
 // was previously the only way to set these fields for those).
 let editingDebtDetails = null;
 function openDebtDetailsForm(debt) {
   if (!debt) return;
+  closeAcctForm(); // never leave the add-account panel stacked behind this
   editingDebtDetails = debt;
   $("debtDetailsRate").value = debt.interest_rate ?? "";
   $("debtDetailsMinPay").value = debt.minimum_payment ?? "";
   $("debtDetailsDue").value = debt.due_date ?? "";
+  const hasLimit = CREDIT_LIMIT_LIABILITY_TYPES.has(debt.type);
+  $("debtDetailsLimitSection").classList.toggle("hidden", !hasLimit);
+  if (hasLimit) $("debtDetailsLimit").value = debt.credit_limit ?? "";
+  const hasCycle = GRACE_PERIOD_LIABILITY_TYPES.has(debt.type);
+  $("debtDetailsCycleSection").classList.toggle("hidden", !hasCycle);
+  if (hasCycle) {
+    $("debtDetailsStatementDay").value = debt.statement_day ?? "";
+    $("debtDetailsDueDay").value = debt.due_day ?? "";
+    $("debtDetailsStatementBalance").value = debt.last_statement_balance ?? "";
+    $("debtDetailsStatementDate").value = debt.last_statement_date ?? "";
+    const dates = cycleDates(debt.statement_day, debt.due_day);
+    $("debtDetailsCycleInfo").textContent = dates
+      ? `Current cycle closed ${dates.statementDate}, payment due ${dates.dueDate}. Paying the statement balance in full by the due date avoids interest entirely; paying only the minimum does not.`
+      : "Set both days to track whether this card is about to be charged interest.";
+  }
   const isHeloc = debt.type === "heloc";
   $("debtDetailsDrawSection").classList.toggle("hidden", !isHeloc);
   if (isHeloc) {
@@ -1307,16 +1939,43 @@ function closeDebtDetailsForm() {
 $("debtDetailsCancelBtn").onclick = closeDebtDetailsForm;
 $("debtDetailsSaveBtn").onclick = async () => {
   if (!editingDebtDetails) return;
+  const touchedIds = ["debtDetailsRate", "debtDetailsMinPay", "debtDetailsDue"];
   const patch = {
     interest_rate: $("debtDetailsRate").value !== "" ? parseFloat($("debtDetailsRate").value) : null,
     minimum_payment: $("debtDetailsMinPay").value !== "" ? parseFloat($("debtDetailsMinPay").value) : null,
     due_date: $("debtDetailsDue").value || null,
   };
   if (editingDebtDetails.type === "heloc") {
+    touchedIds.push("debtDetailsDrawEnd");
     patch.draw_period_end = $("debtDetailsDrawEnd").value || null;
   }
+  if (CREDIT_LIMIT_LIABILITY_TYPES.has(editingDebtDetails.type)) {
+    touchedIds.push("debtDetailsLimit");
+    const limit = $("debtDetailsLimit").value !== "" ? parseFloat($("debtDetailsLimit").value) : null;
+    if (limit !== null && (!Number.isFinite(limit) || limit < 0)) { flagField("debtDetailsLimit"); return toast("Credit limit can't be negative"); }
+    patch.credit_limit = limit;
+  }
+  if (GRACE_PERIOD_LIABILITY_TYPES.has(editingDebtDetails.type)) {
+    touchedIds.push("debtDetailsStatementDay", "debtDetailsDueDay", "debtDetailsStatementBalance", "debtDetailsStatementDate");
+    const day = (id) => ($(id).value !== "" ? parseInt($(id).value, 10) : null);
+    const statementDay = day("debtDetailsStatementDay");
+    const dueDay = day("debtDetailsDueDay");
+    for (const [label, v, id] of [["Statement closes", statementDay, "debtDetailsStatementDay"], ["Payment due", dueDay, "debtDetailsDueDay"]]) {
+      if (v !== null && (!Number.isInteger(v) || v < 1 || v > 31)) { flagField(id); return toast(`${label} must be a day from 1 to 31`); }
+    }
+    const stmtBalance = $("debtDetailsStatementBalance").value !== ""
+      ? parseFloat($("debtDetailsStatementBalance").value) : null;
+    if (stmtBalance !== null && (!Number.isFinite(stmtBalance) || stmtBalance < 0)) {
+      flagField("debtDetailsStatementBalance");
+      return toast("Statement balance can't be negative");
+    }
+    patch.statement_day = statementDay;
+    patch.due_day = dueDay;
+    patch.last_statement_balance = stmtBalance;
+    patch.last_statement_date = $("debtDetailsStatementDate").value || null;
+  }
   const { error } = await sb.from("liabilities").update(patch).eq("id", editingDebtDetails.id);
-  if (error) return toast(error.message);
+  if (error) { flagField(touchedIds); return toast(error.message); }
   closeDebtDetailsForm();
   await loadDebts();
   toast("Liability details saved");
@@ -1324,13 +1983,25 @@ $("debtDetailsSaveBtn").onclick = async () => {
 
 // ---- ADJUST A LIABILITY'S BALANCE (owed vs. paying it down) -------------
 // "Paying balance" (transfer: asset down, liability down, never a new
-// expense) is always available. "Owed" (direct set + add-a-charge) only
-// shows for a liability with NO linked credit account - one linked to a
-// credit account skips the tabs entirely and opens straight to Paying,
-// since its owed amount can now only move through an actual credit
-// expense (quick-add/edit, account type credit - applyLiabilityDelta),
-// never a typed number. A standalone Loan/Mortgage/Other liability has no
-// purchase trail to reconcile against, so it keeps manual Owed editing.
+// expense) and "Owed" (direct set + add-a-charge) are both available for
+// every liability, account-linked or standalone.
+//
+// This reverses an earlier deliberate rule, at the user's explicit request.
+// Previously an account-linked liability (a credit card, a HELOC) could only
+// move through real dated expenses, on the reasoning that its balance should
+// always be reconstructable from its purchase trail. In practice the trail
+// drifts from reality - a charge logged late, a refund, a fee or an interest
+// charge the app never saw - and there was no way to reconcile against the
+// actual statement short of inventing fake expenses, which corrupts the
+// history far worse than a typed correction does.
+//
+// What keeps the reversal safe is that every manual correction is now
+// written to account_activity as an 'owed_adjust' row (see
+// 39_account_activity_kinds.sql): it shows up in the Log page's history, it
+// says who moved the number and by how much, and it is undoable. The old
+// rule's real goal was "an owed balance should never change without a
+// traceable reason" - a logged adjustment satisfies that, an untracked
+// typed number would not.
 let activeDebtId = null;
 
 function currentDebtTab() {
@@ -1346,8 +2017,7 @@ function setDebtTab(tab) {
 
 function openDebtBalanceForm(debtId, tab) {
   const modal = $("debtBalanceForm");
-  const isCreditLinked = accounts.some((a) => a.linked_liability_id === debtId);
-  const effectiveTab = isCreditLinked ? "paying" : tab;
+  const effectiveTab = tab;
   // Tapping the same entry point again (same debt, same tab already showing)
   // while the modal is open closes it; anything else switches to it instead.
   if (activeDebtId === debtId && effectiveTab === currentDebtTab() && !modal.classList.contains("hidden")) {
@@ -1357,10 +2027,11 @@ function openDebtBalanceForm(debtId, tab) {
   }
   const debt = debts.find((d) => d.id === debtId);
   if (!debt) return;
+  closeAcctForm(); // never leave the add-account panel stacked behind this
   activeDebtId = debtId;
   $("debtBalanceLabel").textContent = debt.name;
   $("debtBalanceCurrent").textContent = fmt(debt.balance);
-  $("debtTabRow").classList.toggle("hidden", isCreditLinked);
+  $("debtTabRow").classList.remove("hidden");
   $("debtOwedSet").value = String(debt.balance);
   $("debtOwedAmount").value = "";
   $("payAmount").value = "";
@@ -1379,50 +2050,68 @@ $("debtBalanceClose").onclick = closeDebtBalanceForm;
 // charge that was missed or double-logged), not for a new charge (that's
 // debtOwedConfirm below, which adds instead of replacing). Only reachable
 // for a standalone liability - see openDebtBalanceForm.
+// The delta is what gets logged, not the new total - an owed_adjust row
+// carries a SIGNED amount exactly like asset_adjust, so undoing it is the
+// same "subtract whatever the original delta was" operation whether the
+// correction raised or lowered the balance. Storing the typed total instead
+// would make a "set" impossible to reverse, which is the bug asset_adjust
+// already had once and had to be fixed for.
+async function logOwedAdjust(debt, delta, reason) {
+  if (!delta) return; // no actual change, nothing worth a history row
+  const debtAccountId = accounts.find((a) => a.linked_liability_id === debt.id)?.id ?? null;
+  await logActivity("owed_adjust", reason, delta, undefined, debtAccountId, null, debt.id);
+}
+
 $("debtOwedSetConfirm").onclick = async () => {
   const newBalance = parseFloat($("debtOwedSet").value);
-  if (!Number.isFinite(newBalance)) return toast("Enter a valid amount");
-  if (newBalance < 0) return toast("Amount owed can't be negative");
+  if (!Number.isFinite(newBalance)) { flagField("debtOwedSet"); return toast("Enter a valid amount"); }
+  if (newBalance < 0) { flagField("debtOwedSet"); return toast("Amount owed can't be negative"); }
   const debt = debts.find((d) => d.id === activeDebtId);
   if (!debt) return;
-  const { error } = await sb.from("liabilities").update({ balance: Math.round(newBalance * 100) / 100 }).eq("id", debt.id);
-  if (error) return toast(error.message);
+  const rounded = Math.round(newBalance * 100) / 100;
+  const delta = Math.round((rounded - Number(debt.balance)) * 100) / 100;
+  const { error } = await sb.from("liabilities").update({ balance: rounded }).eq("id", debt.id);
+  if (error) { flagField("debtOwedSet"); return toast(error.message); }
+  await logOwedAdjust(debt, delta, `Corrected ${debt.name} owed to ${fmt(rounded)}`);
   await loadDebts();
+  renderRecentTransactions();
   closeDebtBalanceForm();
   toast("Amount owed updated");
 };
 
 $("debtOwedConfirm").onclick = async () => {
   const amount = parseFloat($("debtOwedAmount").value);
-  if (!amount || amount <= 0) return toast("Enter a valid amount");
+  if (!amount || amount <= 0) { flagField("debtOwedAmount"); return toast("Enter a valid amount"); }
   const debt = debts.find((d) => d.id === activeDebtId);
   if (!debt) return;
   const newBalance = Math.round((Number(debt.balance) + amount) * 100) / 100;
   const { error } = await sb.from("liabilities").update({ balance: newBalance }).eq("id", debt.id);
-  if (error) return toast(error.message);
+  if (error) { flagField("debtOwedAmount"); return toast(error.message); }
+  await logOwedAdjust(debt, amount, `Added ${fmt(amount)} charge to ${debt.name}`);
   $("debtOwedAmount").value = "";
   await loadDebts();
+  renderRecentTransactions();
   closeDebtBalanceForm();
   toast("Added to balance owed");
 };
 
 $("payConfirmBtn").onclick = async () => {
   const amount = parseFloat($("payAmount").value);
-  if (!amount || amount <= 0) return toast("Enter a valid amount");
+  if (!amount || amount <= 0) { flagField("payAmount"); return toast("Enter a valid amount"); }
   const assetId = $("payFromAsset").value;
-  if (!assetId) return toast("Choose an account to pay from - add one in the Accounts card if none are listed.");
+  if (!assetId) { flagField("payFromAsset"); return toast("Choose an account to pay from - add one in the Accounts card if none are listed."); }
   const debt = debts.find((d) => d.id === activeDebtId);
   const asset = assets.find((a) => a.id === assetId);
-  if (!debt || !asset) return toast("Pick a valid liability and asset");
-  if (amount > Number(asset.value)) return toast(`Not enough in ${asset.name} to pay ${fmt(amount)}`);
+  if (!debt || !asset) { flagField("payFromAsset"); return toast("Pick a valid liability and asset"); }
+  if (amount > Number(asset.value)) { flagField("payAmount"); return toast(`Not enough in ${asset.name} to pay ${fmt(amount)}`); }
 
   const newAssetValue = Math.round((Number(asset.value) - amount) * 100) / 100;
   const newBalance = Math.max(0, Math.round((Number(debt.balance) - amount) * 100) / 100);
 
   const { error: assetErr } = await sb.from("assets").update({ value: newAssetValue }).eq("id", asset.id);
-  if (assetErr) return toast(assetErr.message);
+  if (assetErr) { flagField("payAmount"); return toast(assetErr.message); }
   const { error: debtErr } = await sb.from("liabilities").update({ balance: newBalance }).eq("id", debt.id);
-  if (debtErr) return toast(debtErr.message);
+  if (debtErr) { flagField("payAmount"); return toast(debtErr.message); }
 
   // account_id = the funding account (money actually left it, same as an
   // expense's account_id); related_account_id = the debt's own account,
@@ -1447,8 +2136,12 @@ function renderNetWorth() {
   // Depreciation-adjusted at the call site, not inside computeNetWorth -
   // networth.js stays pure aggregation with no idea depreciation exists
   // (see its own header comment on scope).
-  const depreciatedAssets = assets.map((a) => ({ ...a, value: effectiveAssetValue(a) }));
-  const nw = computeNetWorth(depreciatedAssets, debts);
+  // topLevelAssets/countableDebts both exclude two things here: child
+  // holdings (already rolled into their parent - counting both would
+  // double every invested dollar) and anything belonging to an archived
+  // account (archiving now acts like a delete for net-worth purposes).
+  const depreciatedAssets = topLevelAssets().map((a) => ({ ...a, value: effectiveAssetValue(a) }));
+  const nw = computeNetWorth(depreciatedAssets, countableDebts());
 
   $("netWorthTotal").textContent = fmt(nw.netWorth);
   $("assetsTotal").textContent = fmt(nw.assetsTotal);
@@ -1478,8 +2171,10 @@ function renderNetWorth() {
 // renderNetWorth() (which runs many times per session) - one write per
 // day is the point, not one per render.
 async function snapshotNetWorthIfNeeded() {
-  const depreciatedAssets = assets.map((a) => ({ ...a, value: effectiveAssetValue(a) }));
-  const nw = computeNetWorth(depreciatedAssets, debts);
+  // See renderNetWorth's comment - same two exclusions (child holdings,
+  // archived-account assets/liabilities) apply to the daily snapshot too.
+  const depreciatedAssets = topLevelAssets().map((a) => ({ ...a, value: effectiveAssetValue(a) }));
+  const nw = computeNetWorth(depreciatedAssets, countableDebts());
   const snapshot_date = new Date().toISOString().slice(0, 10);
   await sb.from("net_worth_snapshots").upsert(
     { snapshot_date, assets_total: nw.assetsTotal, liabilities_total: nw.liabilitiesTotal, net_worth: nw.netWorth },
@@ -1491,14 +2186,60 @@ async function snapshotNetWorthIfNeeded() {
 // There's no separate "Payment" field anymore - an expense's payment type
 // IS whatever type the chosen Account is (cash/debit/credit values match
 // exactly), so there's nothing left to derive it from independently, and
-// no way for the two to disagree. A payment-type word in the free text
-// (e.g. "debit") still auto-picks the matching account, but only when
-// there's exactly one of that type - picking the wrong one silently would
-// be worse than leaving it for the user to choose.
-function selectAccountByType(type) {
-  if (!type) return;
-  const matches = accounts.filter((a) => a.type === type);
-  if (matches.length === 1) $("fAccount").value = matches[0].id;
+// no way for the two to disagree.
+//
+// A payment-type word ("debit") and/or a bank name ("bank of america") in
+// the free text can each narrow which account is meant, and combine rather
+// than compete when both appear - only an account matching every signal
+// actually found in the text survives. That means "chase debit" can
+// resolve to the one Chase debit account even with a second (Chase credit)
+// account present, which "chase" alone would leave ambiguous. Bank-name
+// matching is a plain case-insensitive substring check against the user's
+// own already-saved accounts (a small, exact list) - not the fuzzy,
+// FDIC-wide isKnownBank() logic used to validate a bank name when adding
+// an account elsewhere; that one is answering a different question ("is
+// this a real bank"), this one is "which of MY accounts does this refer
+// to." Auto-selects only when exactly one account survives every filter
+// that matched something - typing nothing recognizable, or something that
+// matches 2+ accounts (two accounts at the same bank), leaves Account on
+// "None" for the user to pick themselves. Silently guessing wrong here
+// would be worse than not guessing at all.
+function accountsMatchingBankName(text) {
+  if (!text) return [];
+  const lower = text.toLowerCase();
+  return accounts.filter((a) => a.bank_name && lower.includes(a.bank_name.toLowerCase()));
+}
+function selectAccountFromText(text, type) {
+  let candidates = accounts;
+  let matchedSomething = false;
+  if (type) {
+    candidates = candidates.filter((a) => a.type === type);
+    matchedSomething = true;
+  }
+  const bankMatches = accountsMatchingBankName(text);
+  if (bankMatches.length) {
+    const bankMatchIds = new Set(bankMatches.map((a) => a.id));
+    candidates = candidates.filter((a) => bankMatchIds.has(a.id));
+    matchedSomething = true;
+  }
+  if (matchedSomething && candidates.length === 1) $("fAccount").value = candidates[0].id;
+}
+
+// Live "still needs to be filled in" signal, not a submit-attempt-only
+// flash - a red border (`.field-required`, index.html) on whichever of the
+// four fields saveBtn actually requires (same order it validates in) is
+// currently empty, clearing itself the moment that field gets a value from
+// either the user or a parse. Re-run after every keyword/Gemma auto-fill
+// and on direct edits to any of the four, so it always reflects current
+// state rather than only appearing after a rejected Save.
+const REQUIRED_QUICK_ADD_FIELDS = ["fAmount", "fAccount", "fCategory", "fDate"];
+function updateRequiredFieldHighlighting() {
+  for (const id of REQUIRED_QUICK_ADD_FIELDS) {
+    $(id).classList.toggle("field-required", !$(id).value);
+  }
+}
+for (const id of REQUIRED_QUICK_ADD_FIELDS) {
+  $(id).addEventListener("input", updateRequiredFieldHighlighting);
 }
 
 $("quick").addEventListener("input", (e) => {
@@ -1508,11 +2249,12 @@ $("quick").addEventListener("input", (e) => {
   // Layer 1: instant keyword parse (always on, README §3.5).
   const p = quickParse(raw);
   $("fAmount").value = p.amount ?? "";
-  selectAccountByType(p.payment_type);
+  selectAccountFromText(raw, p.payment_type);
   $("fDesc").value = p.rest;
   const guessed = categorize(raw, userRules);
   if (guessed) $("fCategory").value = guessed;
   entrySource = "manual";
+  updateRequiredFieldHighlighting();
   // Layer 2: best-effort Gemma enrichment, debounced (README §3.6).
   scheduleGemma(raw);
 });
@@ -1547,17 +2289,18 @@ function scheduleGemma(raw) {
     $("parseStatus").textContent = "Asking Gemma…";
     try {
       const g = await parseWithGemma(sent, {
-        endpoint: GEMMA_ENDPOINT, model: GEMMA_MODEL, today: $("fDate").value,
+        endpoint: GEMMA_ENDPOINT, model: GEMMA_MODEL, key: GEMMA_AUTH_KEY, today: $("fDate").value,
       });
       // Only apply if the user hasn't typed something new in the meantime.
       if ($("quick").value !== sent) { $("parseStatus").textContent = ""; return; }
       if (g.amount != null) $("fAmount").value = g.amount;
-      selectAccountByType(g.payment_type);
+      selectAccountFromText(sent, g.payment_type);
       if (g.merchant) $("fDesc").value = g.merchant;
       if (g.category) $("fCategory").value = g.category;
       if (g.occurred_at) $("fDate").value = g.occurred_at;
       entrySource = "parsed";
       $("parseStatus").textContent = "Parsed by Gemma - confirm & save";
+      updateRequiredFieldHighlighting();
     } catch (err) {
       // Home machine asleep / unreachable - keep the keyword guess.
       $("parseStatus").textContent = "Gemma unavailable - using quick parse";
@@ -1566,19 +2309,20 @@ function scheduleGemma(raw) {
 }
 
 $("saveBtn").onclick = async () => {
+  updateRequiredFieldHighlighting(); // guaranteed-fresh red border right as Save is attempted
   const amount = parseFloat($("fAmount").value);
-  if (!amount || amount <= 0) return toast("Enter a valid amount");
+  if (!amount || amount <= 0) { flagField("fAmount"); return toast("Enter a valid amount"); }
   const accountId = $("fAccount").value || null;
-  if (!accountId) return toast("Select an account");
+  if (!accountId) { flagField("fAccount"); return toast("Select an account"); }
   const category = $("fCategory").value || null;
-  if (!category) return toast("Select a category");
+  if (!category) { flagField("fCategory"); return toast("Select a category"); }
   const occurredAt = $("fDate").value;
-  if (!occurredAt) return toast("Select a date");
+  if (!occurredAt) { flagField("fDate"); return toast("Select a date"); }
   // No separate Payment field - the account IS the payment type, since
   // account.type and payment_type share the same values (cash/debit/credit).
   const paymentType = accounts.find((a) => a.id === accountId).type;
   const assetErr = assetDeltaError([{ accountId, paymentType, amount, sign: -1 }]);
-  if (assetErr) return toast(assetErr);
+  if (assetErr) { flagField("fAccount"); return toast(assetErr); }
   const desc = $("fDesc").value.trim();
   const fullText = $("quick").value.trim();
   const row = {
@@ -1593,7 +2337,7 @@ $("saveBtn").onclick = async () => {
   $("saveBtn").disabled = true;
   const { error } = await sb.from("expenses").insert(row);
   $("saveBtn").disabled = false;
-  if (error) return toast(error.message);
+  if (error) { flagField("fAmount"); return toast(error.message); }
   await applyAssetDelta(row.account_id, row.payment_type, amount, -1);
   await applyLiabilityDelta(row.account_id, row.payment_type, amount, +1);
   $("quick").value = ""; $("confirm").classList.add("hidden"); $("parseStatus").textContent = "";
@@ -1699,8 +2443,8 @@ $("csvStep2Back").onclick = () => {
 $("csvStep2Next").onclick = () => {
   const dateCol = $("csvMapDate").value !== "" ? Number($("csvMapDate").value) : null;
   const amountCol = $("csvMapAmount").value !== "" ? Number($("csvMapAmount").value) : null;
-  if (dateCol == null || amountCol == null) return toast("Pick a Date and an Amount column");
-  if (!$("csvAccount").value) return toast("Pick an account to import into");
+  if (dateCol == null || amountCol == null) { flagField(["csvMapDate", "csvMapAmount"]); return toast("Pick a Date and an Amount column"); }
+  if (!$("csvAccount").value) { flagField("csvAccount"); return toast("Pick an account to import into"); }
   csvMapping = {
     dateCol, amountCol,
     descCol: $("csvMapDesc").value !== "" ? Number($("csvMapDesc").value) : null,
@@ -1726,7 +2470,7 @@ $("csvStep2Next").onclick = () => {
     ? csvPreviewRows.map((r, i) => `
       <div class="exp" style="cursor:default">
         <div style="display:flex;align-items:center;gap:8px;min-width:0">
-          <input type="checkbox" class="csv-row-select" data-csv-idx="${i}" ${r.duplicate ? "" : "checked"} style="flex-shrink:0" />
+          <input type="checkbox" class="csv-row-select" data-csv-idx="${i}" ${r.duplicate ? "" : "checked"} style="width:auto;flex-shrink:0" />
           <div style="min-width:0">
             <div>${esc(r.normalized.description || "(no description)")}${r.duplicate ? ` <span class="muted" style="font-size:11px">possible duplicate</span>` : ""}</div>
             <div class="meta">${r.normalized.occurred_at}${r.normalized.category ? " · " + esc(r.normalized.category) : ""}</div>
@@ -1774,6 +2518,7 @@ $("csvImportConfirm").onclick = async () => {
     const { data, error } = await sb.from("expenses").insert(chunk).select("id");
     if (error) {
       $("csvImportConfirm").disabled = false;
+      flagField("csvAccount");
       return toast(`Import failed partway through (${csvLastImportedIds.length} rows written): ${error.message}`);
     }
     csvLastImportedIds.push(...(data || []).map((r) => r.id));
@@ -1800,7 +2545,7 @@ $("csvUndoImportBtn").onclick = async () => {
 
 // ---- EXPENSE LIST ----------------------------------------------------------
 // Shared row template + click-to-edit wiring for any expense/transaction
-// list - the Log page's Recent Transactions (expenses + account_activity
+// list - the Log page's Recent History (expenses + account_activity
 // merged, see recentTransactions below) and the Reports page's per-month
 // expense log (expenses only) both use this, scoped to their own container
 // so the two lists (each with their own `rows` array/index) never cross-wire.
@@ -1814,7 +2559,7 @@ $("csvUndoImportBtn").onclick = async () => {
 // fat-fingered, a payment made against the wrong debt - can be corrected
 // from the list directly instead of hunting down the right form to
 // reverse it by hand. See undoTransaction() below.
-// `selectable` (Recent Transactions only, not the Reports month log - see
+// `selectable` (Recent History only, not the Reports month log - see
 // callers) adds a checkbox to expense rows for bulkApplyBtn/bulkClearBtn
 // below; account_activity rows never get one, since category doesn't
 // apply to them. selectedTxnIds is checked, not just set, on render so a
@@ -1828,11 +2573,15 @@ function renderExpenseList(containerId, rows, emptyMsg, { selectable = false } =
         <div>${esc(r.description)}</div>
         <div class="meta">${r.occurred_at} · ${ACTIVITY_LABEL[r.kind] || "Account activity"}</div>
       </div>
-      <span class="amt">${fmt(Math.abs(r.amount))}<span class="x" data-undo-idx="${i}" style="margin-left:8px;cursor:pointer" title="Undo">↶</span></span>
+      <span class="amt">${NON_UNDOABLE_ACTIVITY_KINDS.has(r.kind) ? "" : fmt(Math.abs(r.amount))}${
+        NON_UNDOABLE_ACTIVITY_KINDS.has(r.kind)
+          ? ""
+          : `<span class="x" data-undo-idx="${i}" style="margin-left:8px;cursor:pointer" title="Undo">↶</span>`
+      }</span>
     </div>` : `
     <div class="exp" data-idx="${i}">
       <div style="display:flex;align-items:center;gap:8px;min-width:0">
-        ${selectable ? `<input type="checkbox" class="txn-select" data-sel-idx="${i}" style="flex-shrink:0" ${selectedTxnIds.has(r.id) ? "checked" : ""} />` : ""}
+        ${selectable ? `<input type="checkbox" class="txn-select" data-sel-idx="${i}" style="width:auto;flex-shrink:0" ${selectedTxnIds.has(r.id) ? "checked" : ""} />` : ""}
         <div style="min-width:0">
           <div>${esc(r.description || r.merchant || "(no description)")}</div>
           <div class="meta">${r.occurred_at} · ${esc(r.category || "Uncategorized")}${r.payment_type ? " · " + accountTypeLabel(r.payment_type) : ""}${acctName(r.account_id) ? " · " + esc(acctName(r.account_id)) : ""}</div>
@@ -1861,7 +2610,7 @@ function renderExpenseList(containerId, rows, emptyMsg, { selectable = false } =
   });
 }
 
-// Selected ids persist across a Recent Transactions re-render (filter
+// Selected ids persist across a Recent History re-render (filter
 // change, new data) - cleared only by Clear, a successful Apply, or
 // signing out. Keyed by expenses.id, so it only ever holds expense rows,
 // never account_activity ones (see renderExpenseList above).
@@ -1888,7 +2637,7 @@ $("bulkApplyBtn").onclick = async () => {
   toast(`Recategorized ${n} expense${n === 1 ? "" : "s"} to ${category}`);
 };
 
-// Reverses a transaction picked from Recent Transactions (or the Reports
+// Reverses a transaction picked from Recent History (or the Reports
 // monthly log, which shares this same list renderer) - an expense gets
 // deleted with its asset/liability effect reversed, exactly like the edit
 // modal's Delete button; an account_activity row (a balance adjustment or
@@ -1935,6 +2684,16 @@ async function undoActivity(row) {
     if (newValue < 0) return toast(`Can't undo - would take ${asset.name} below $0.`);
     const { error } = await sb.from("assets").update({ value: newValue }).eq("id", asset.id);
     if (error) return toast(error.message);
+  } else if (row.kind === "owed_adjust") {
+    // Signed delta, same convention as asset_adjust - reversing is always
+    // "subtract what was applied," correct whether the original correction
+    // raised the balance (a missed charge, an interest charge) or lowered it.
+    const debt = row.liability_id ? debts.find((d) => d.id === row.liability_id) : null;
+    if (!debt) return toast("Can't undo - the liability no longer exists.");
+    const newBalance = Math.round((Number(debt.balance) - Number(row.amount)) * 100) / 100;
+    if (newBalance < 0) return toast(`Can't undo - would take ${debt.name} below $0 owed.`);
+    const { error } = await sb.from("liabilities").update({ balance: newBalance }).eq("id", debt.id);
+    if (error) return toast(error.message);
   } else if (row.kind === "liability_payment") {
     const account = accounts.find((a) => a.id === row.account_id);
     const asset = account ? assets.find((a) => a.id === account.linked_asset_id) : null;
@@ -1946,6 +2705,20 @@ async function undoActivity(row) {
     if (assetErr) return toast(assetErr.message);
     const { error: debtErr } = await sb.from("liabilities").update({ balance: newBalance }).eq("id", debt.id);
     if (debtErr) return toast(debtErr.message);
+  } else if (row.kind === "contribution") {
+    // Unlike asset_adjust, this goes straight to asset_id - a contribution
+    // is logged against the specific investment asset directly (most are
+    // standalone, no account to indirect through via account_id at all;
+    // see 42_contribution_tracking.sql). amount is always positive (a
+    // contribution only ever adds money in), so undoing is always a
+    // straight subtraction, never a sign-dependent one like asset_adjust's.
+    const asset = row.asset_id ? assets.find((a) => a.id === row.asset_id) : null;
+    if (!asset) return toast("Can't undo - the investment no longer exists.");
+    const newValue = Math.round((Number(asset.value) - Number(row.amount)) * 100) / 100;
+    if (newValue < 0) return toast(`Can't undo - would take ${asset.name} below $0.`);
+    const { error } = await sb.from("assets").update({ value: newValue }).eq("id", asset.id);
+    if (error) return toast(error.message);
+    await syncParentAssetValue(asset.parent_asset_id); // no-op unless asset is itself a holding
   }
   const { error } = await sb.from("account_activity").delete().eq("id", row.id);
   if (error) return toast(error.message);
@@ -2002,8 +2775,8 @@ function renderRecentTransactions() {
   };
   const anyFilterActive = Object.values(filters).some((v) => v !== "" && v !== null);
   const emptyMsg = anyFilterActive
-    ? "No transactions match these filters."
-    : "No transactions yet - add an expense above.";
+    ? "No history matches these filters."
+    : "No history yet - add an expense above.";
   renderExpenseList("expList", recentTransactions(50, filters), emptyMsg, { selectable: true });
   updateBulkActionBar();
 }
@@ -2027,6 +2800,7 @@ async function loadExpenses() {
   $("monthCount").textContent = monthRows.length;
   renderNetWorth();
   renderBudgetWarnings();
+  renderBudgets(); // Log-page card now, so it refreshes with the expense list
 
   populateTxnCategoryFilter();
   renderRecentTransactions();
@@ -2057,13 +2831,13 @@ $("editClose").onclick = () => { $("editModal").classList.add("hidden"); editing
 $("editSave").onclick = async () => {
   if (!editing) return;
   const amount = parseFloat($("eAmount").value);
-  if (!amount || amount <= 0) return toast("Enter a valid amount");
+  if (!amount || amount <= 0) { flagField("eAmount"); return toast("Enter a valid amount"); }
   const accountId = $("eAccount").value;
-  if (!accountId) return toast("Select an account");
+  if (!accountId) { flagField("eAccount"); return toast("Select an account"); }
   const newCategory = $("eCategory").value || null;
-  if (!newCategory) return toast("Select a category");
+  if (!newCategory) { flagField("eCategory"); return toast("Select a category"); }
   const occurredAt = $("eDate").value;
-  if (!occurredAt) return toast("Select a date");
+  if (!occurredAt) { flagField("eDate"); return toast("Select a date"); }
   // No separate Payment field - same as quick-add, the account IS the
   // payment type. This also removes the only way payment_type and the
   // selected account could ever disagree, so there's no credit-account
@@ -2087,11 +2861,11 @@ $("editSave").onclick = async () => {
     { accountId: prevAccountId, paymentType: prevPaymentType, amount: prevAmount, sign: +1 },
     { accountId: patch.account_id, paymentType: patch.payment_type, amount, sign: -1 },
   ]);
-  if (assetErr) return toast(assetErr);
+  if (assetErr) { flagField("eAccount"); return toast(assetErr); }
 
   $("editSave").disabled = true;
   const { error } = await sb.from("expenses").update(patch).eq("id", editing.id);
-  if (error) { $("editSave").disabled = false; return toast(error.message); }
+  if (error) { $("editSave").disabled = false; flagField("eAmount"); return toast(error.message); }
 
   // Reverse the old asset/liability effect (if any), then apply the new one -
   // covers amount/account/payment-type all changing in the same edit.
@@ -2133,6 +2907,10 @@ $("editDelete").onclick = async () => {
 
 // ---- REPORTS ---------------------------------------------------------------
 async function loadReports() {
+  // Fire-and-forget: loads the model into memory in the background so it's
+  // likely already warm by the time the user finishes reading this page and
+  // clicks Ask - see warmUpGemma()'s own comment in gemma.js for why.
+  if (GEMMA_ENDPOINT) warmUpGemma({ endpoint: GEMMA_ENDPOINT, model: GEMMA_MODEL, key: GEMMA_AUTH_KEY });
   if (!allExpenses.length) await loadExpenses();
   // Build month selector from the last 12 months.
   const months = lastMonths(12).reverse(); // newest first for the dropdown
@@ -2164,21 +2942,21 @@ async function renderNetWorthTrend() {
   renderLineChart($("netWorthTrendChart"), labels, rows.map((r) => Number(r.net_worth)));
 }
 
-// ---- BUDGETS -----------------------------------------------------------
+// ---- BUDGETS ---------------------------------------------------------------
 async function loadBudgets() {
   const { data } = await sb.from("budgets").select("*").order("category");
   budgets = data || [];
 }
 
-// Proactive Log-page banner, unlike renderBudgets() (Reports page) which
-// only shows anything to a user who's already navigated there - same
-// "surface it without being asked" pattern assetMaturityNotice/
-// assetStaleNotice already use. Always scoped to the current calendar
-// month (monthKey(), no month-selector input) since that's what "am I
-// about to go over budget right now" actually means, unlike the Reports
-// charts which can look at any past month. Called from loadExpenses()
-// (a new expense can change this) and whenever budgets themselves change
-// (saveBudgetBtn, the delete handler in renderBudgets).
+// The compact at-a-glance banner at the top of the Log page, distinct from
+// the Budgets card further down (renderBudgets) which lists every limit and
+// is where they're set - this one only ever appears when something is
+// actually at or over its limit, the same "surface it without being asked"
+// pattern assetMaturityNotice/assetStaleNotice already use. Both are scoped
+// to the current calendar month (monthKey(), no month-selector input), since
+// that's what "am I about to go over budget right now" means. Called from
+// loadExpenses() (a new expense can change this) and whenever budgets
+// themselves change (saveBudgetBtn, the delete handler in renderBudgets).
 function renderBudgetWarnings() {
   const byCat = sumBy(allExpenses, "category", monthKey());
   budgetWarnings = budgetStatus(budgets, byCat).filter((s) => s.warn);
@@ -2199,10 +2977,14 @@ function budgetWarningToastSuffix(category) {
   return w.over ? ` · ${category} is over budget` : ` · ${category} is at ${w.pct}% of budget`;
 }
 
-// Called from renderReports() with that render's own byCat, rather than
-// recomputing sumBy() a second time - scoped to whatever month monthSel
-// has selected, unlike the account-history/net-worth-trend charts.
-function renderBudgets(byCat) {
+// Lives on the Log page now, not Reports, so it is always scoped to the
+// CURRENT month rather than following the Reports month selector - a limit
+// you are setting is about the month you are in, and a budget bar that
+// silently reported some other month's spend because a selector three
+// screens away was left on it would be actively misleading. Called from
+// loadExpenses() alongside renderBudgetWarnings(), which already computes
+// the same current-month sumBy for the warning banner.
+function renderBudgets(byCat = sumBy(allExpenses, "category", monthKey())) {
   const statuses = budgetStatus(budgets, byCat);
   $("budgetsList").innerHTML = statuses.length
     ? statuses.map((s) => {
@@ -2228,7 +3010,7 @@ function renderBudgets(byCat) {
       const { error } = await sb.from("budgets").delete().eq("category", el.dataset.delBudget);
       if (error) return toast(error.message);
       await loadBudgets();
-      renderReports();
+      renderBudgets();
       renderBudgetWarnings(); // a removed budget can also remove a Log-page warning
       toast("Budget removed");
     };
@@ -2238,14 +3020,14 @@ function renderBudgets(byCat) {
 $("saveBudgetBtn").onclick = async () => {
   const category = $("budgetCategory").value;
   const monthly_limit = parseFloat($("budgetLimit").value);
-  if (!category) return toast("Pick a category");
-  if (!Number.isFinite(monthly_limit) || monthly_limit <= 0) return toast("Enter a valid monthly limit");
+  if (!category) { flagField("budgetCategory"); return toast("Pick a category"); }
+  if (!Number.isFinite(monthly_limit) || monthly_limit <= 0) { flagField("budgetLimit"); return toast("Enter a valid monthly limit"); }
   const { error } = await sb.from("budgets")
     .upsert({ category, monthly_limit }, { onConflict: "user_id,category" });
-  if (error) return toast(error.message);
+  if (error) { flagField("budgetLimit"); return toast(error.message); }
   $("budgetLimit").value = "";
   await loadBudgets();
-  renderReports();
+  renderBudgets();
   renderBudgetWarnings(); // a changed limit can newly trigger (or clear) a Log-page warning
   toast("Budget set");
 };
@@ -2260,7 +3042,7 @@ async function loadInvestmentTargets() {
 // reasoning and shape as snapshotNetWorthIfNeeded above - no cron/server
 // trigger exists for a static PWA.
 async function snapshotPortfolioIfNeeded() {
-  const investmentAssets = assets.filter((a) => INVESTMENT_ASSET_TYPES.has(a.type));
+  const investmentAssets = countableInvestmentAssets();
   const holdings = investmentHoldings(investmentAssets, assetPriceFindings);
   const totals = portfolioTotals(holdings, investmentAssets);
   const snapshot_date = new Date().toISOString().slice(0, 10);
@@ -2270,70 +3052,173 @@ async function snapshotPortfolioIfNeeded() {
   );
 }
 
+// Same portfolio_snapshots query feeds both the full-history "Value over
+// time" chart and the Daily health check card's compact recent-trend
+// sparkline (last HEALTH_SPARKLINE_DAYS points) - one fetch, two renders,
+// rather than a second round-trip for what's already the same rows.
+const HEALTH_SPARKLINE_DAYS = 14;
+
 async function renderInvestmentsTrend() {
   const { data } = await sb.from("portfolio_snapshots").select("*").order("snapshot_date", { ascending: true });
   const rows = data || [];
-  $("investTrendEmpty").classList.toggle("hidden", rows.length >= 2);
-  if (rows.length < 2) return; // a single point isn't a "trend"
-  const labels = rows.map((r) => {
+  const dayLabel = (r) => {
     const [y, m, d] = r.snapshot_date.split("-").map(Number);
     return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  });
-  renderLineChart($("investTrendChart"), labels, rows.map((r) => Number(r.total_value)));
+  };
+
+  $("investTrendEmpty").classList.toggle("hidden", rows.length >= 2);
+  if (rows.length >= 2) {
+    renderLineChart($("investTrendChart"), rows.map(dayLabel), rows.map((r) => Number(r.total_value)));
+  }
+
+  const recent = rows.slice(-HEALTH_SPARKLINE_DAYS);
+  $("investHealthTrendEmpty").classList.toggle("hidden", recent.length >= 2);
+  if (recent.length >= 2) {
+    renderLineChart($("investHealthTrendChart"), recent.map(dayLabel), recent.map((r) => Number(r.total_value)));
+  }
 }
 
 const gainColor = (n) => (n == null ? "" : n >= 0 ? "var(--ok)" : "var(--err)");
 const signedPct = (n) => (n >= 0 ? "+" : "") + n + "%";
 
+// Every investment-flavoured asset, parents and per-ticker holdings alike,
+// EXCLUDING anything belonging to an archived account (archivedAccountAssetIds
+// - same "archived acts deleted" rule as topLevelAssets). Fine for DISPLAY,
+// where the grouping wants both parent and holdings, but never for
+// totalling - see countableInvestmentAssets.
+function allInvestmentAssets() {
+  const hidden = archivedAccountAssetIds();
+  return assets.filter((a) => INVESTMENT_ASSET_TYPES.has(a.type) && !hidden.has(a.id));
+}
+// The set that may be summed without double-counting. An account whose value
+// is the roll-up of its own holdings (syncParentAssetValue) is dropped, since
+// those holdings are each counted individually here; an account with no
+// holdings recorded keeps its own blended value, which is the only figure it
+// has. Getting this wrong doubles the portfolio total, so every totalling
+// call (portfolioTotals, allocationVsTarget, the daily snapshot) goes
+// through this rather than filtering inline.
+function countableInvestmentAssets() {
+  const investmentAssets = allInvestmentAssets();
+  const parentsWithHoldings = new Set(
+    investmentAssets.filter((a) => a.parent_asset_id).map((a) => a.parent_asset_id)
+  );
+  return investmentAssets.filter((a) => !parentsWithHoldings.has(a.id));
+}
+
 function renderInvestments() {
-  const investmentAssets = assets.filter((a) => INVESTMENT_ASSET_TYPES.has(a.type));
+  const investmentAssets = allInvestmentAssets();          // display: parents + holdings
+  const countable = countableInvestmentAssets();           // maths: never both
   const holdings = investmentHoldings(investmentAssets, assetPriceFindings);
-  const totals = portfolioTotals(holdings, investmentAssets);
+  const totals = portfolioTotals(investmentHoldings(countable, assetPriceFindings), countable);
 
   $("investTotalValue").textContent = fmt(totals.totalValue);
   $("investTotalCostBasis").textContent = fmt(totals.totalCostBasis);
   $("investTotalGainLoss").textContent = totals.totalGainLoss != null
-    ? `${fmt(totals.totalGainLoss)} (${signedPct(totals.totalGainLossPct)})` : "—";
+    ? `${fmt(totals.totalGainLoss)} (${signedPct(totals.totalGainLossPct)})` : "-";
   $("investTotalGainLoss").style.color = gainColor(totals.totalGainLoss);
   $("investTodayChangeEmpty").classList.toggle("hidden", totals.todayChange != null);
   $("investTodayChange").textContent = totals.todayChange != null
-    ? `${fmt(totals.todayChange)} (${signedPct(totals.todayChangePct)})` : "—";
+    ? `${fmt(totals.todayChange)} (${signedPct(totals.todayChangePct)})` : "-";
   $("investTodayChange").style.color = gainColor(totals.todayChange);
 
-  $("investHoldingsList").innerHTML = investmentAssets.length ? investmentAssets.map((a) => {
+  // Grouped account-first: each investment account, then the individual
+  // tickers held inside it (assets with parent_asset_id set). An account
+  // with no holdings still shows its own blended value, which is what a
+  // plain 401(k) with no per-ticker detail actually is.
+  const parents = investmentAssets.filter((a) => !a.parent_asset_id);
+  const holdingRow = (a) => {
     const h = holdings.find((x) => x.asset.id === a.id);
     if (!h) {
-      // Symbol-less investment asset (a blended 401(k), say) - value only,
-      // nothing to compute gain/loss or a day-change against.
       return `
-        <div class="exp" style="cursor:default">
-          <div>
-            <div>${esc(a.name)}</div>
-            <div class="meta">${assetTypeLabel(a.type)}</div>
-          </div>
-          <span class="amt">${fmt(effectiveAssetValue(a))}</span>
+        <div class="exp" data-edit-holding="${a.id}" style="cursor:pointer;padding-left:12px">
+          <div><div>${esc(a.name)}</div><div class="meta">no symbol set</div></div>
+          <span class="amt">${fmt(effectiveAssetValue(a))}<span class="x" data-del-holding="${a.id}" style="margin-left:8px">✕</span></span>
         </div>`;
     }
     return `
-      <div class="exp" style="cursor:default;flex-direction:column;align-items:stretch;gap:4px">
+      <div class="exp" data-edit-holding="${a.id}" style="cursor:pointer;flex-direction:column;align-items:stretch;gap:4px;padding-left:12px">
         <div style="display:flex;justify-content:space-between;gap:10px">
           <div>
-            <div>${esc(h.symbol)} <span class="muted" style="font-size:12px">${esc(a.name)}</span></div>
+            <div>${esc(h.symbol)}</div>
             <div class="meta">${h.quantity ?? "?"} @ ${h.latestPrice != null ? fmt(h.latestPrice) : "no live price yet"}</div>
           </div>
           <div style="text-align:right">
-            <div class="amt">${fmt(h.currentValue)}</div>
+            <div class="amt">${fmt(h.currentValue)}<span class="x" data-del-holding="${a.id}" style="margin-left:8px">✕</span></div>
             <div style="font-size:12px;color:${gainColor(h.gainLoss)}">${h.gainLoss != null ? `${fmt(h.gainLoss)} (${signedPct(h.gainLossPct)})` : "no cost basis set"}</div>
             ${h.dayChange != null ? `<div style="font-size:12px;color:${gainColor(h.dayChange)}">today ${fmt(h.dayChange)} (${signedPct(h.dayChangePct)})</div>` : ""}
           </div>
         </div>
         ${h.explanation ? `<div class="muted" style="font-size:12px">${esc(h.explanation)}</div>` : ""}
       </div>`;
+  };
+  $("investHoldingsList").innerHTML = parents.length ? parents.map((p) => {
+    const children = investmentAssets.filter((a) => a.parent_asset_id === p.id);
+    return `
+      <div style="margin-bottom:14px">
+        <div class="exp" style="cursor:default">
+          <div>
+            <div><strong>${esc(p.name)}</strong></div>
+            <div class="meta">${assetTypeLabel(p.type)}${children.length ? ` · ${children.length} holding${children.length === 1 ? "" : "s"}` : ""}</div>
+            <div class="muted" data-log-contribution="${p.id}" style="font-size:11px;cursor:pointer;text-decoration:underline;margin-top:2px">Log contribution</div>
+          </div>
+          <span class="amt">${fmt(effectiveAssetValue(p))}</span>
+        </div>
+        ${children.length
+          ? children.map(holdingRow).join("")
+          : `<p class="muted" style="font-size:12px;padding-left:12px;margin:6px 0 0">No specific holdings recorded - use "+ Add stock" to enter tickers.</p>`}
+      </div>`;
   }).join("") : `<p class="muted" style="font-size:13px">No investments added yet - add one from the Assets card on the Log page (Brokerage, IRA, 401(k), crypto, ...).</p>`;
+  document.querySelectorAll("[data-log-contribution]").forEach((el) => {
+    el.onclick = (ev) => { ev.stopPropagation(); openContributionForm(el.dataset.logContribution); };
+  });
+  document.querySelectorAll("[data-edit-holding]").forEach((el) => {
+    el.onclick = () => openHoldingForm(assets.find((a) => a.id === el.dataset.editHolding));
+  });
+  document.querySelectorAll("[data-del-holding]").forEach((el) => {
+    el.onclick = async (ev) => {
+      ev.stopPropagation(); // don't also open the edit form
+      const holding = assets.find((a) => a.id === el.dataset.delHolding);
+      if (!holding) return;
+      if (!(await confirmModal(`Removes ${holding.name} from this account. Its account total is recalculated from the remaining holdings.`,
+        { title: "Delete this holding?" }))) return;
+      const parentId = holding.parent_asset_id;
+      const { error } = await sb.from("assets").delete().eq("id", holding.id);
+      if (error) return toast(error.message);
+      await loadAssets();
+      await syncParentAssetValue(parentId);
+      await loadAssets();
+      renderInvestments();
+      renderNetWorth();
+      toast("Holding deleted");
+    };
+  });
+
+  // Base 2025 IRS limits, factual math only - see CONTRIBUTION_LIMIT_GROUPS'
+  // own comment. Colored red once over the limit, same as renderBudgets'
+  // over-budget styling - this
+  // is a real hard legal limit, not the soft "aim for under 30%" utilization
+  // guideline the Liabilities card's credit-utilization line deliberately
+  // leaves uncolored, so a color here is stating a fact, not nudging advice.
+  const contributions = accountActivity.filter((a) => a.kind === "contribution");
+  const limitUsage = contributionLimitUsage(assets, contributions, CONTRIBUTION_LIMIT_GROUPS);
+  $("contributionLimitsCard").style.display = limitUsage.length ? "" : "none";
+  $("contributionLimitsList").innerHTML = limitUsage.map((u) => {
+    const pctClamped = Math.min(100, (u.contributed / u.limit) * 100);
+    return `
+      <div style="margin-bottom:10px">
+        <div class="row" style="justify-content:space-between;font-size:13px">
+          <span>${esc(u.label)}</span>
+          <span style="${u.overLimit ? "color:var(--err)" : ""}">${fmt(u.contributed)} / ${fmt(u.limit)}${u.overLimit ? " - over limit" : ""}</span>
+        </div>
+        <div style="background:var(--panel-2);border-radius:6px;height:6px;margin-top:4px;overflow:hidden">
+          <div style="background:${u.overLimit ? "var(--err)" : "var(--ok)"};width:${pctClamped}%;height:100%"></div>
+        </div>
+      </div>`;
+  }).join("");
 
   $("investRiskLabel").value = profile?.risk_label ?? "";
 
-  const allocation = allocationVsTarget(investmentAssets, holdings, investmentTargets);
+  const allocation = allocationVsTarget(countable, holdings, investmentTargets);
   $("investTargetsList").innerHTML = allocation.length ? allocation.map((a) => {
     const pctClamped = Math.min(100, a.currentPct);
     const barColor = a.currentPct > a.targetPercent ? "var(--err)" : "var(--ok)";
@@ -2361,17 +3246,397 @@ function renderInvestments() {
       toast("Target removed");
     };
   });
+
+  renderInvestmentHealth(totals, allocation, limitUsage, holdings);
 }
 
+// Daily health check card (index.html, top of investView) - a short
+// compilation of the totals/allocation/limitUsage/holdings this function
+// already computed above, via investments.js's portfolioHealthSummary.
+// That function returns raw structured data, not text - formatting and
+// esc() happen here, same split every other Investments render function
+// already keeps between math and presentation.
+const HEALTH_TONE_COLOR = { ok: "var(--ok)", warn: "var(--err)", neutral: "var(--muted)" };
+function healthLineText(l) {
+  switch (l.kind) {
+    case "today":
+      return l.change != null
+        ? `Today ${fmt(l.change)} (${signedPct(l.changePct)}) - portfolio at ${fmt(l.value)}`
+        : `Portfolio at ${fmt(l.value)} - no live price data yet for today's change`;
+    case "gainLoss":
+      return l.gainLoss != null
+        ? `${fmt(l.gainLoss)} (${signedPct(l.gainLossPct)}) since cost basis`
+        : `No cost basis on file yet - gain/loss can't be calculated`;
+    case "allocation":
+      return l.tone === "ok"
+        ? "Allocation is within target"
+        : `${esc(l.bucket)} is ${Math.abs(l.drift)}% ${l.drift > 0 ? "over" : "under"} target`;
+    case "contributions":
+      return l.overCount
+        ? `${l.overCount} of ${l.groupCount} contribution group${l.groupCount === 1 ? "" : "s"} over the annual limit`
+        : l.approachingCount
+        ? `${l.approachingCount} of ${l.groupCount} contribution group${l.groupCount === 1 ? "" : "s"} approaching its annual limit`
+        : "Contributions within limits";
+    case "pricing":
+      return l.priced === l.total
+        ? `Live pricing available for all ${l.total} holding${l.total === 1 ? "" : "s"}`
+        : `Live pricing available for ${l.priced} of ${l.total} holding${l.total === 1 ? "" : "s"}`;
+    default:
+      return "";
+  }
+}
+function renderInvestmentHealth(totals, allocation, limitUsage, holdings) {
+  const health = portfolioHealthSummary(totals, allocation, limitUsage, holdings);
+  $("investHealthList").innerHTML = health.map((l) => `
+    <div style="display:flex;align-items:center;gap:8px;font-size:13px;padding:4px 0">
+      <span style="width:8px;height:8px;border-radius:50%;flex:none;background:${HEALTH_TONE_COLOR[l.tone]}"></span>
+      <span>${healthLineText(l)}</span>
+    </div>`).join("");
+}
+
+// Market overview card (top of investView) - a fixed set of major US
+// indexes, genuinely NOT tied to anything the user owns (unlike every
+// other Investments render function). Same dormant-until-flag shape as
+// renderAssetPriceFindings: fully hidden while PRICE_FINDINGS_ENABLED is
+// off, since unlike the Daily health check card above (which always has
+// real facts about the user's own entered data to show), there's no
+// manual-entry fallback for a market index - an empty "not available yet"
+// card forever would be pure clutter, not a fact worth stating.
+function renderMarketOverview() {
+  const card = $("marketOverviewCard");
+  if (!card) return;
+  if (!PRICE_FINDINGS_ENABLED) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  const indexes = marketIndexSummary(MARKET_INDEXES, marketIndexFindings);
+  $("marketOverviewList").innerHTML = indexes.map((idx) => `
+    <div class="exp" style="cursor:default">
+      <div>
+        <div>${esc(idx.label)}</div>
+        ${idx.explanation ? `<div class="meta">${esc(idx.explanation)}</div>` : ""}
+      </div>
+      <span class="amt" style="text-align:right">
+        ${idx.price != null ? fmtNum(idx.price) : `<span class="muted" style="font-size:12px">not available yet</span>`}
+        ${idx.change != null ? `<div style="font-size:12px;color:${gainColor(idx.change)}">${signedPct(idx.changePct)}</div>` : ""}
+      </span>
+    </div>`).join("");
+
+  const movers = topMarketMovers(MARKET_MOVERS_WATCHLIST, marketIndexFindings, 3);
+  const moversSection = $("marketMoversSection");
+  if (moversSection) moversSection.classList.toggle("hidden", !movers.length);
+  $("marketMoversList").innerHTML = movers.map((m) => `
+    <div class="exp" style="cursor:default">
+      <div>
+        <div>${esc(m.label)}</div>
+        ${m.explanation ? `<div class="meta">${esc(m.explanation)}</div>` : ""}
+      </div>
+      <span class="amt" style="text-align:right">
+        ${fmtNum(m.price)}
+        <div style="font-size:12px;color:${gainColor(m.change)}">${signedPct(m.changePct)}</div>
+      </span>
+    </div>`).join("");
+}
+
+// ---- HOLDINGS (specific tickers inside an investment account) -----------
+// The gap this closes: price_symbol/quantity were only reachable from the
+// standalone-asset form, so an investment account created from the Accounts
+// card had no way to record what was actually bought in it - it tracked one
+// blended number and nothing else. A holding is an `assets` row with
+// parent_asset_id pointing at the account's asset (40_asset_holdings.sql).
+let editingHolding = null;
+
+// A pension is an income promise, not a tradable security - there is no
+// real-world "ticker" a pension holds, unlike every other INVESTMENT_ASSET_
+// TYPES entry. Excluded here specifically, not from INVESTMENT_ASSET_TYPES
+// itself - a pension asset still shows up everywhere else on the
+// Investments tab (total value, the plain listing) exactly as before, it
+// just can't be the PARENT of a new ticker holding. Everything else stays
+// eligible, including `annuity`: a FIXED annuity has no ticker either, but
+// a VARIABLE annuity genuinely does (its value tracks named sub-account
+// funds, much like a 401(k)'s fund menu) - there's no separate fixed/
+// variable type to gate on, so this stays permissive rather than blocking
+// a real use case to guard against a different one.
+const TICKER_ELIGIBLE_ASSET_TYPES = new Set(
+  [...INVESTMENT_ASSET_TYPES].filter((t) => t !== "pension")
+);
+
+// Base 2025 IRS contribution limits, no catch-up/income-phase-out/filing-
+// status adjustments. Every excluded
+// type's specific reason for not being tracked (sep_ira needs income data
+// this app doesn't have, 529/UTMA use a gift-tax exclusion rather than a
+// clean single limit, a rollover/inherited IRA generally can't receive new
+// contributions at all, ...). Consumed by contributionLimitUsage()
+// (investments.js), which stays free of this app-level configuration the
+// same way it already takes INVESTMENT_ASSET_TYPES-derived lists as
+// arguments rather than hardcoding them itself.
+//
+// Which types share one limit vs. have their own is the part most likely
+// to be gotten wrong by intuition - a 401(k) and a 457(b) look similar but
+// do NOT share a limit, while a Traditional and a Roth 401(k) look
+// different but DO. Verify the current year's actual figures before
+// relying on this for a real contribution decision - this is a reference
+// calculator showing your own logged numbers back to you, not tax advice,
+// and a stale limit would be worse than showing none.
+const CONTRIBUTION_LIMIT_GROUPS = {
+  elective_deferral: {
+    types: ["traditional_401k", "roth_401k", "plan_403b", "tsp", "solo_401k"],
+    limit: 23500,
+    label: "401(k) / 403(b) / TSP",
+  },
+  plan_457b: { types: ["plan_457b"], limit: 23500, label: "457(b)" },
+  ira: { types: ["traditional_ira", "roth_ira"], limit: 7000, label: "IRA (Traditional + Roth combined)" },
+  simple_ira: { types: ["simple_ira"], limit: 16500, label: "SIMPLE IRA" },
+  espp: { types: ["espp"], limit: 25000, label: "ESPP" },
+};
+
+// Only accounts that can actually contain positions. An investment account
+// created from the Accounts card has a linked asset; a standalone investment
+// asset added from the Assets card can hold tickers too, so both are offered
+// as parents. A holding itself is never a parent (no nesting).
+function holdingParentAssets() {
+  // allInvestmentAssets() already drops anything belonging to an archived
+  // account (archivedAccountAssetIds) - so an archived account isn't
+  // offered as somewhere to file a new holding either. Deliberately NOT
+  // countableInvestmentAssets(): that helper drops a parent that ALREADY
+  // has holdings, for double-counting reasons in totals - the wrong list
+  // here, since an account with existing positions must still be offered
+  // as somewhere to add another one.
+  return allInvestmentAssets().filter(
+    (a) => !a.parent_asset_id && TICKER_ELIGIBLE_ASSET_TYPES.has(a.type)
+  );
+}
+
+// Required fields on the holding form: an explicit account, a ticker, share
+// count, and cost basis - the same "starts blank, red border while empty"
+// treatment as REQUIRED_QUICK_ADD_FIELDS, reused rather than reinvented.
+// holdingValue is deliberately absent - it stays genuinely optional (falls
+// back to cost basis, see saveHoldingBtn).
+const REQUIRED_HOLDING_FIELDS = ["holdingAccount", "holdingSymbol", "holdingQuantity", "holdingCostBasis"];
+// Tracks the exact symbol text the user has already confirmed via the
+// "not recognized, add anyway" override, so re-showing that confirm on
+// every subsequent save click (with nothing changed) would be needless -
+// cleared whenever the symbol text itself changes, so a genuinely new,
+// still-unconfirmed symbol is always re-checked.
+let holdingSymbolOverrideConfirmedFor = null;
+// Live, on every keystroke in any of the four - plain emptiness only.
+// Deliberately does NOT include the "unrecognized ticker" check (see
+// updateHoldingSymbolTickerHighlight below) - that one is checked only at
+// save time, not here, even though holdingSymbol is one of the four ids
+// this function runs against. Using classList.toggle (not .add) matters
+// for that separation: it unconditionally SETS the class to match current
+// emptiness on every call, which is also what clears a previous ticker-
+// invalid flag the instant the user edits the text at all, before the
+// (separate, save-time-only) validity check has even re-run.
+function updateHoldingFieldHighlighting() {
+  for (const id of REQUIRED_HOLDING_FIELDS) {
+    $(id).classList.toggle("field-required", !$(id).value);
+  }
+}
+// A non-empty holdingSymbol that isn't a recognized ticker and hasn't been
+// override-confirmed yet is ALSO red, on top of the plain-empty check above -
+// but only evaluated at save time (called from saveHoldingBtn), never wired
+// to holdingSymbol's own input event. Flagging every partial, still-being-
+// typed ticker as "wrong" while the user is mid-typing "AAPL" would be
+// actively annoying - caught by testing the live-typing experience, not
+// assumed safe just because the empty-check version of this pattern was
+// already proven to work well for Quick Add.
+function updateHoldingSymbolTickerHighlight() {
+  const symbol = $("holdingSymbol").value.trim().toUpperCase();
+  const parentType = assets.find((a) => a.id === $("holdingAccount").value)?.type;
+  if (symbol && symbol !== holdingSymbolOverrideConfirmedFor && !isKnownTicker(symbol, parentType)) {
+    $("holdingSymbol").classList.add("field-required");
+  }
+}
+for (const id of REQUIRED_HOLDING_FIELDS) {
+  $(id).addEventListener("input", updateHoldingFieldHighlighting);
+}
+// A changed symbol invalidates any prior override confirmation for the OLD
+// text - typing over a confirmed "BRK.A" into something else must be
+// re-checked, not silently inherit the earlier confirmation.
+$("holdingSymbol").addEventListener("input", () => { holdingSymbolOverrideConfirmedFor = null; });
+
+function openHoldingForm(holding) {
+  editingHolding = holding || null;
+  holdingSymbolOverrideConfirmedFor = null;
+  const parents = holdingParentAssets();
+  if (!parents.length) {
+    return toast("Add an investment account first (Accounts or Assets card on the Log page) - a pension can't hold individual tickers.");
+  }
+  const opts = parents
+    .map((a) => `<option value="${a.id}">${esc(a.name)} (${assetTypeLabel(a.type)})</option>`).join("");
+  // New holding: starts on the blank "Choose an account" option, same
+  // "required means actually reachable as empty" fix already applied to
+  // Quick Add's Category - defaulting to parents[0] silently would make
+  // the required-field check below structurally unreachable, the exact
+  // bug that was already found and fixed once. Editing an existing holding
+  // still explicitly selects its real current parent, same as eCategory
+  // does for an existing expense's real category.
+  $("holdingAccount").innerHTML = holding
+    ? opts
+    : `<option value="">Choose an account</option>${opts}`;
+  $("holdingAccount").value = holding?.parent_asset_id ?? "";
+  $("holdingSymbol").value = holding?.price_symbol ?? "";
+  $("holdingQuantity").value = holding?.quantity ?? "";
+  $("holdingCostBasis").value = holding?.purchase_price ?? "";
+  $("holdingValue").value = holding?.value ?? "";
+  $("holdingBucket").value = holding?.investment_bucket ?? "";
+  updateHoldingFieldHighlighting();
+  $("holdingForm").classList.remove("hidden");
+  $("holdingForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+function closeHoldingForm() {
+  $("holdingForm").classList.add("hidden");
+  editingHolding = null;
+  holdingSymbolOverrideConfirmedFor = null;
+}
+$("addHoldingBtn").onclick = () => {
+  if ($("holdingForm").classList.contains("hidden")) openHoldingForm(null);
+  else closeHoldingForm();
+};
+$("cancelHoldingBtn").onclick = closeHoldingForm;
+
+$("saveHoldingBtn").onclick = async () => {
+  // Guaranteed-fresh red borders right as Save is attempted - both halves,
+  // since updateHoldingSymbolTickerHighlight is otherwise never wired to
+  // fire on its own (deliberately not live, see its own comment).
+  updateHoldingFieldHighlighting();
+  updateHoldingSymbolTickerHighlight();
+  const parentId = $("holdingAccount").value;
+  if (!parentId) { flagField("holdingAccount"); return toast("Choose the account this sits in"); }
+  const symbol = $("holdingSymbol").value.trim().toUpperCase();
+  if (!symbol) { flagField("holdingSymbol"); return toast("Enter a ticker or symbol"); }
+  // Shares and cost basis are required, not optional - a holding without
+  // them was previously just a name with no actual position behind it.
+  if ($("holdingQuantity").value === "") { flagField("holdingQuantity"); return toast("Enter the number of shares"); }
+  const quantity = parseFloat($("holdingQuantity").value);
+  if (!Number.isFinite(quantity) || quantity <= 0) { flagField("holdingQuantity"); return toast("Shares must be a positive number"); }
+  if ($("holdingCostBasis").value === "") { flagField("holdingCostBasis"); return toast("Enter what you paid in total"); }
+  const costBasis = parseFloat($("holdingCostBasis").value);
+  if (!Number.isFinite(costBasis) || costBasis < 0) { flagField("holdingCostBasis"); return toast("Cost basis can't be negative"); }
+  const value = $("holdingValue").value !== "" ? parseFloat($("holdingValue").value) : null;
+  if (value !== null && (!Number.isFinite(value) || value < 0)) { flagField("holdingValue"); return toast("Current value can't be negative"); }
+
+  const parent = assets.find((a) => a.id === parentId);
+  // isKnownTicker() checks a hand-curated, necessarily incomplete list
+  // (tickers.js) - a no-match is a confirmation, not a hard stop, same
+  // "comprehensive but not exhaustive" override bank-name entry already
+  // established (saveAcctBtn). Skipped entirely once already confirmed for
+  // this exact symbol text this time around.
+  if (symbol !== holdingSymbolOverrideConfirmedFor && !isKnownTicker(symbol, parent?.type)) {
+    const kind = parent?.type === "crypto" ? "crypto symbol" : "ticker";
+    const ok = await confirmModal(
+      `"${symbol}" isn't in our list of recognized ${kind}s. If this is real and we're just missing it, you can add it as typed.`,
+      { title: `${kind === "crypto symbol" ? "Symbol" : "Ticker"} not recognized`, confirmLabel: "Add anyway" }
+    );
+    if (!ok) { updateHoldingSymbolTickerHighlight(); return; }
+    holdingSymbolOverrideConfirmedFor = symbol;
+  }
+
+  const row = {
+    // A holding inherits its parent's type so INVESTMENT_ASSET_TYPES keeps
+    // matching it and the Investments tab picks it up with no special case.
+    name: symbol,
+    type: parent?.type ?? "investment",
+    parent_asset_id: parentId,
+    price_symbol: symbol,
+    quantity,
+    purchase_price: costBasis,
+    // A blank Current Value no longer means "worth $0" (that's a real,
+    // false claim about a position that was just paid costBasis for) - it
+    // means "not priced yet," which is honestly closer to costBasis than
+    // to zero until a live price arrives (syncParentAssetValue/price-agent).
+    value: value ?? costBasis,
+    investment_bucket: $("holdingBucket").value.trim() || null,
+  };
+  // Captured before closeHoldingForm() clears editingHolding below.
+  const wasEditing = !!editingHolding;
+  // Moving a holding between accounts changes BOTH totals, so the old
+  // parent is resynced too, not just the new one.
+  const previousParentId = editingHolding?.parent_asset_id;
+  const { error } = editingHolding
+    ? await sb.from("assets").update(row).eq("id", editingHolding.id)
+    : await sb.from("assets").insert(row);
+  if (error) { flagField("holdingSymbol"); return toast(error.message); }
+  closeHoldingForm();
+  await loadAssets();
+  await syncParentAssetValue(parentId);
+  if (previousParentId && previousParentId !== parentId) await syncParentAssetValue(previousParentId);
+  await loadAssets();
+  renderInvestments();
+  renderNetWorth();
+  toast(wasEditing ? "Holding updated" : "Holding added");
+};
+
+// ---- CONTRIBUTIONS (Investments tab) -------------------------------------
+// One shared panel, retargeted per account - same pattern assetAdjustForm
+// already uses for Checking/Cash (openAssetAdjust). Writing 'contribution'
+// through logActivity (rather than a plain assets.update) is the whole
+// point - it's what lets contributionLimitUsage() later tell "new money in"
+// apart from a market gain or a manual correction.
+let contributingAssetId = null;
+function closeContributionForm() {
+  $("contributionForm").classList.add("hidden");
+  contributingAssetId = null;
+}
+function openContributionForm(assetId) {
+  const asset = assets.find((a) => a.id === assetId);
+  if (!asset) return;
+  // Tapping the same account's link again while its panel is already open
+  // closes it - same toggle-shut convenience openAssetAdjust already has.
+  if (contributingAssetId === assetId && !$("contributionForm").classList.contains("hidden")) {
+    closeContributionForm();
+    return;
+  }
+  contributingAssetId = assetId;
+  $("contributionLabel").textContent = `Log a contribution to ${asset.name}`;
+  $("contributionAmount").value = "";
+  $("contributionDate").value = new Date().toISOString().slice(0, 10);
+  $("contributionAmount").classList.remove("field-required");
+  $("contributionForm").classList.remove("hidden");
+  $("contributionForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+$("cancelContributionBtn").onclick = closeContributionForm;
+$("contributionAmount").addEventListener("input", () => {
+  $("contributionAmount").classList.toggle("field-required", !$("contributionAmount").value);
+});
+$("saveContributionBtn").onclick = async () => {
+  const asset = assets.find((a) => a.id === contributingAssetId);
+  if (!asset) return closeContributionForm();
+  if (!$("contributionAmount").value) { flagField("contributionAmount"); return toast("Enter an amount"); }
+  const amount = parseFloat($("contributionAmount").value);
+  if (!Number.isFinite(amount) || amount <= 0) { flagField("contributionAmount"); return toast("Enter a positive amount"); }
+  const occurred_at = $("contributionDate").value || new Date().toISOString().slice(0, 10);
+  const newValue = Math.round((Number(asset.value) + amount) * 100) / 100;
+  const { error } = await sb.from("assets").update({ value: newValue }).eq("id", asset.id);
+  if (error) { flagField("contributionAmount"); return toast(error.message); }
+  // account_id: the linked account if this asset has one (most investment
+  // assets are standalone and won't), purely so Recent History's account
+  // filter can also surface a contribution the same way it already does
+  // for asset_adjust - asset_id (not account_id) is what
+  // contributionLimitUsage() actually reads.
+  const linkedAccountId = accounts.find((a) => a.linked_asset_id === asset.id)?.id ?? null;
+  await logActivity(
+    "contribution", `Contributed ${fmt(amount)} to ${asset.name}`,
+    amount, occurred_at, linkedAccountId, null, null, asset.id
+  );
+  await syncParentAssetValue(asset.parent_asset_id); // no-op unless asset is itself a holding
+  closeContributionForm();
+  await loadAssets();
+  renderInvestments();
+  renderRecentTransactions();
+  renderNetWorth();
+  toast("Contribution logged");
+};
+
 $("saveInvestTargetBtn").onclick = async () => {
-  const bucket = $("investTargetBucket").value.trim();
+  // investTargetBucket is a fixed select with no blank option (see
+  // populateInvestBucketSelects) - always a real bucket, nothing to
+  // validate as "missing" the way a free-text field would need.
+  const bucket = $("investTargetBucket").value;
   const target_percent = parseFloat($("investTargetPercent").value);
-  if (!bucket) return toast("Enter a bucket name");
-  if (!Number.isFinite(target_percent) || target_percent < 0 || target_percent > 100) return toast("Enter a valid target percent (0-100)");
+  if (!Number.isFinite(target_percent) || target_percent < 0 || target_percent > 100) { flagField("investTargetPercent"); return toast("Enter a valid target percent (0-100)"); }
   const { error } = await sb.from("investment_targets")
     .upsert({ bucket, target_percent }, { onConflict: "user_id,bucket" });
-  if (error) return toast(error.message);
-  $("investTargetBucket").value = "";
+  if (error) { flagField("investTargetPercent"); return toast(error.message); }
   $("investTargetPercent").value = "";
   await loadInvestmentTargets();
   renderInvestments();
@@ -2386,7 +3651,7 @@ $("saveInvestTargetBtn").onclick = async () => {
 $("investRiskLabel").onchange = async () => {
   const risk_label = $("investRiskLabel").value || null;
   const { error } = await sb.from("profiles").upsert({ id: userId, risk_label }, { onConflict: "id" });
-  if (error) return toast(error.message);
+  if (error) { flagField("investRiskLabel"); return toast(error.message); }
   profile = { ...(profile || {}), risk_label };
   toast("Risk label saved");
 };
@@ -2434,23 +3699,67 @@ async function loadInsights() {
 }
 
 // ---- INTERACTIVE Q&A (Gemma, optional/best-effort like Phase 3) -----------
+
+// RAG retrieval, additive to buildQaContext's recent-window data (see
+// supabase/45_expense_embeddings.sql's header for the full rationale).
+// Embeds the question, vector-searches expense_embeddings for whatever's
+// semantically relevant, and only ever looks at transactions strictly
+// older than `sinceDate` (buildQaContext's own recent-window boundary) so
+// nothing gets double-counted between the two sources. Best-effort by
+// design, matching every other Gemma call in this app: a retrieval
+// failure (embeddings not indexed yet, home machine unreachable, RPC
+// error) must never block the actual answer, so any failure here just
+// returns an empty array rather than throwing.
+async function retrieveRelevantHistory(question, sinceDate) {
+  try {
+    const vector = await embedText(question, { endpoint: GEMMA_EMBED_ENDPOINT, model: GEMMA_EMBED_MODEL || "nomic-embed-text", key: GEMMA_AUTH_KEY });
+    const { data: matches } = await sb.rpc("match_expense_embeddings", {
+      query_embedding: vector, match_count: 10, before_date: sinceDate,
+    });
+    if (!matches?.length) return [];
+    const ids = matches.map((m) => m.expense_id);
+    const { data: rows } = await sb.from("expenses").select("*").in("id", ids);
+    return (rows || []).map((e) => ({
+      date: e.occurred_at,
+      amount: Number(e.amount),
+      category: e.category || null,
+      description: e.description || e.merchant || null,
+      payment_type: e.payment_type || null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
 $("qaAskBtn").onclick = async () => {
   const question = $("qaQuestion").value.trim();
-  if (!question) return toast("Type a question first");
+  if (!question) { flagField("qaQuestion"); return toast("Type a question first"); }
   if (!GEMMA_ENDPOINT) {
     $("qaStatus").textContent = "Not configured - set GEMMA_ENDPOINT in config.js (SETUP.md §3.6).";
     return;
   }
   $("qaAskBtn").disabled = true;
   $("qaAnswer").classList.add("hidden");
-  $("qaStatus").textContent = "Thinking…";
+  // Sets an honest expectation up front rather than a bare "Thinking…" -
+  // the home model can take up to ~20s (askGemma's own timeout) if it
+  // wasn't already warmed up by loadReports() opening this page.
+  $("qaStatus").textContent = "Thinking… (can take up to ~20s on the home model, less if you've had this page open a bit)";
   try {
     if (!allExpenses.length) await loadExpenses();
-    const context = buildQaContext(allExpenses, subscriptions, 6, profile);
-    const answer = await askGemma(question, context, { endpoint: GEMMA_ENDPOINT, model: GEMMA_MODEL });
+    const since = lastMonths(6)[0] + "-01"; // same boundary buildQaContext computes internally
+    const relevantHistory = await retrieveRelevantHistory(question, since);
+    const context = buildQaContext(allExpenses, subscriptions, 6, profile, relevantHistory);
+    const answer = await askGemma(question, context, { endpoint: GEMMA_ENDPOINT, model: GEMMA_MODEL, key: GEMMA_AUTH_KEY });
     $("qaAnswer").textContent = answer;
     $("qaAnswer").classList.remove("hidden");
-    $("qaStatus").textContent = "";
+    // Transparency, matching this app's existing "state the real math/
+    // scope, don't blend in silently" conventions (the ticker/bank-list
+    // "comprehensive but not exhaustive" caveats, Daily health check's
+    // real-numbers-only stance) - the user can see when older history
+    // actually contributed to the answer, not just trust it happened.
+    $("qaStatus").textContent = relevantHistory.length
+      ? `Also found ${relevantHistory.length} older transaction${relevantHistory.length === 1 ? "" : "s"} related to this question.`
+      : "";
   } catch (err) {
     $("qaStatus").textContent = "Couldn't get an answer - is Gemma reachable? (" + err.message + ")";
   } finally {
@@ -2479,7 +3788,6 @@ async function renderReports() {
 
   const monthRows = allExpenses.filter((r) => (r.occurred_at || "").startsWith(ym));
   renderExpenseList("rptExpList", monthRows, "No expenses this month.");
-  renderBudgets(byCat);
 
   renderBreakdownBar($("catChart"), byCat);
   renderBreakdownBar($("acctChart"), byAcct);
@@ -2488,7 +3796,7 @@ async function renderReports() {
   renderTrendBar($("trendChart"), trailing, monthlyTotals(allExpenses, trailing));
 }
 
-// ---- MONTH REPORT EXPORT ------------------------------------------------
+// ---- MONTH REPORT EXPORT ---------------------------------------------------
 // Recomputes ym/monthRows fresh rather than reading renderReports()'s
 // locals - cheap (already-loaded allExpenses, no new query) and avoids
 // threading extra state through just for these two buttons.
@@ -2548,8 +3856,7 @@ td,th{padding:6px 8px;border-bottom:1px solid #ddd;text-align:left;font-size:13p
 // pattern acctBank already uses for bank_name. Category values in the DB are
 // therefore whatever the user actually typed, not one of these fixed
 // strings - don't add a CHECK constraint or validate against this list.
-// Set drawn from real-world recurring-bill category research (utilities,
-// insurance, streaming, memberships, financial fees, ...).
+// Set drawn from prior subscription/bill-category research.
 const SUBSCRIPTION_CATEGORY_SUGGESTIONS = [
   "Utilities", "Housing", "Insurance", "Streaming & Media", "Software & Cloud",
   "Memberships & Dues", "Subscription Commerce", "Financial & Fees",
@@ -2604,7 +3911,11 @@ async function autoLogDueSubscriptions() {
     if (!sub.is_active || !sub.next_renewal || !sub.account_id) continue;
     if (!["monthly", "quarterly", "semiannual", "annual"].includes(sub.billing_cycle)) continue;
     const account = accounts.find((a) => a.id === sub.account_id);
-    if (!account) continue;
+    // A real delete already stops this loop (account_id -> null on delete,
+    // per schema, fails the !sub.account_id check above); archiving must
+    // stop it the same way, or this would keep silently charging an
+    // account that's supposed to act deleted every time the app loads.
+    if (!account || account.archived_at) continue;
     const paymentType = account.type;
     const amount = Number(sub.amount);
 
@@ -2646,7 +3957,7 @@ async function autoLogDueSubscriptions() {
   }
 }
 
-// ---- RECURRING-EXPENSE DETECTION (README appendix open decision) --------
+// ---- RECURRING-EXPENSE DETECTION (README appendix open decision) -----------
 // Depends on both allExpenses and subscriptions, which load in parallel in
 // init() (Promise.all) - called from the end of both loadExpenses() and
 // loadSubscriptions() so it re-renders correctly once whichever finishes
@@ -2724,8 +4035,9 @@ function renderDeals() {
   // row per matched plan type, same "tap to open profile" pattern as the
   // student upsell above. Currently always empty in practice, since no
   // real catalog rows exist yet for these plan types (seeding real
-  // researched prices was explicitly deferred); the mechanism is complete
-  // and will start surfacing rows the moment real catalog data exists.
+  // researched prices was explicitly deferred); the
+  // mechanism is complete and will start surfacing rows the moment real
+  // catalog data exists.
   const byPlanType = new Map();
   for (const u of eligUpsells) {
     if (!byPlanType.has(u.planType)) byPlanType.set(u.planType, []);
@@ -2797,8 +4109,8 @@ function renderDealFindings() {
   });
 }
 
-// F6 Phase E: promoting copies a finding's fields into subscription_catalog
-// (a plain insert, not
+// F6 Phase E - promoting copies a
+// finding's fields into subscription_catalog (a plain insert, not
 // atomic with the status update below; low risk for this app's ~2-user
 // trust model, same as the rest of this app's multi-step writes) and
 // marks the finding verified so it stops offering Promote/Reject again.
@@ -2899,8 +4211,8 @@ function closeSubForm() { $("subForm").classList.add("hidden"); editingSub = nul
 $("saveSubBtn").onclick = async () => {
   const name = $("sName").value.trim();
   const amount = parseFloat($("sAmount").value);
-  if (!name) return toast("Service name required");
-  if (!amount || amount <= 0) return toast("Enter a valid amount");
+  if (!name) { flagField("sName"); return toast("Service name required"); }
+  if (!amount || amount <= 0) { flagField("sAmount"); return toast("Enter a valid amount"); }
   const row = {
     name, amount,
     category: $("sCategory").value.trim() || null,
@@ -2917,7 +4229,7 @@ $("saveSubBtn").onclick = async () => {
     : sb.from("subscriptions").insert(row);
   const { error } = await q;
   $("saveSubBtn").disabled = false;
-  if (error) return toast(error.message);
+  if (error) { flagField("sName"); return toast(error.message); }
   closeSubForm();
   await loadSubscriptions();
   toast(editingSub ? "Subscription/bill updated" : "Subscription/bill added");
@@ -2932,13 +4244,13 @@ $("saveSubBtn").onclick = async () => {
 $("markPaidBtn").onclick = async () => {
   if (!editingSub) return;
   const sub = editingSub;
-  if (!sub.account_id) return toast("Link an account to this subscription/bill first, then save, then mark as paid.");
+  if (!sub.account_id) { flagField("sAccount"); return toast("Link an account to this subscription/bill first, then save, then mark as paid."); }
   const account = accounts.find((a) => a.id === sub.account_id);
-  if (!account) return toast("Linked account not found - pick one, save, then mark as paid.");
+  if (!account) { flagField("sAccount"); return toast("Linked account not found - pick one, save, then mark as paid."); }
   const amount = Number(sub.amount);
   const paymentType = account.type;
   const assetErr = assetDeltaError([{ accountId: sub.account_id, paymentType, amount, sign: -1 }]);
-  if (assetErr) return toast(assetErr);
+  if (assetErr) { flagField("sAccount"); return toast(assetErr); }
 
   const row = {
     amount, description: sub.name, merchant: sub.name,
@@ -2948,7 +4260,7 @@ $("markPaidBtn").onclick = async () => {
   };
   $("markPaidBtn").disabled = true;
   const { error } = await sb.from("expenses").insert(row);
-  if (error) { $("markPaidBtn").disabled = false; return toast(error.message); }
+  if (error) { $("markPaidBtn").disabled = false; flagField("sAccount"); return toast(error.message); }
   await applyAssetDelta(sub.account_id, paymentType, amount, -1);
   await applyLiabilityDelta(sub.account_id, paymentType, amount, +1);
 
@@ -3006,6 +4318,33 @@ $("profileBtn").onclick = () => {
 };
 $("profileClose").onclick = () => $("profileModal").classList.add("hidden");
 
+// ---- HELP MODAL --------------------------------------------------------
+// One shared modal (index.html) for all 4 pages' documentation - openHelp
+// swaps which #helpContent* block and pill is active rather than opening
+// four separate modals, so browsing another page's help doesn't need a
+// close/reopen. Static content, no data to load - unlike every other
+// modal in this file, this one has no corresponding loadX()/renderX().
+const HELP_PAGES = ["log", "subs", "reports", "invest"];
+const HELP_TITLES = { log: "Log page help", subs: "Subscriptions/Bills help", reports: "Reports help", invest: "Investments help" };
+function openHelp(page) {
+  $("helpModalTitle").textContent = HELP_TITLES[page];
+  for (const p of HELP_PAGES) {
+    $(`helpContent${cap(p)}`).classList.toggle("hidden", p !== page);
+  }
+  document.querySelectorAll("[data-help-page]").forEach((el) => {
+    el.classList.toggle("active", el.dataset.helpPage === page);
+  });
+  $("helpModal").classList.remove("hidden");
+}
+$("helpLogBtn").onclick = () => openHelp("log");
+$("helpSubsBtn").onclick = () => openHelp("subs");
+$("helpReportsBtn").onclick = () => openHelp("reports");
+$("helpInvestBtn").onclick = () => openHelp("invest");
+$("helpClose").onclick = () => $("helpModal").classList.add("hidden");
+document.querySelectorAll("[data-help-page]").forEach((el) => {
+  el.onclick = () => openHelp(el.dataset.helpPage);
+});
+
 // parseInt returns NaN on empty/invalid input - toNullableInt keeps that
 // out of the row entirely (null) rather than writing NaN, same
 // reasoning as the pre-existing graduation_year handling below.
@@ -3038,14 +4377,14 @@ $("profileSave").onclick = async () => {
   $("profileSave").disabled = true;
   const { error } = await sb.from("profiles").upsert(row, { onConflict: "id" });
   $("profileSave").disabled = false;
-  if (error) return toast(error.message);
+  if (error) { flagField("pName"); return toast(error.message); }
   profile = row;
   $("profileModal").classList.add("hidden");
   renderDeals(); // eligibility may have changed (e.g. now a student, or military)
   toast("Profile saved");
 };
 
-// "Download all my data" - a plain JSON dump of every table this
+// A plain JSON dump of every table this
 // user's own data actually lives in, RLS-scoped automatically since this
 // runs as the signed-in user (not service_role). Deliberately excludes
 // the shared reference tables (subscription_catalog, deal_findings,
@@ -3081,13 +4420,14 @@ $("downloadDataBtn").onclick = async () => {
 // home-screen icon signed in.
 $("setPasswordBtn").onclick = async () => {
   const pw = $("pNewPassword").value;
-  if (!pw || pw.length < 6) return toast("Password must be at least 6 characters");
+  if (!pw || pw.length < 6) { flagField("pNewPassword"); return toast("Password must be at least 6 characters"); }
   $("setPasswordBtn").disabled = true;
   $("setPasswordBtn").textContent = "Saving...";
   const { error } = await sb.auth.updateUser({ password: pw });
   $("setPasswordBtn").disabled = false;
   $("setPasswordBtn").textContent = "Set / change password";
   if (error) {
+    flagField("pNewPassword");
     $("passwordSetMsg").textContent = error.message;
     toast("Couldn't set password");
     return;

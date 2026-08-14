@@ -1,8 +1,7 @@
 -- ============================================================================
 -- F6 stretch - live deal discovery.
 -- Run this after 01-03. Optional: the app works fine with this table empty
--- or unapplied until the home-machine search agent exists
--- (tools/deal-agent.js).
+-- or unapplied until the home-machine search agent exists (Phase B/C).
 --
 -- Separate trust tier from subscription_catalog: machine-found, not curated.
 -- No user_id - a deal ("Spotify student = $5.99") is a public fact, matched

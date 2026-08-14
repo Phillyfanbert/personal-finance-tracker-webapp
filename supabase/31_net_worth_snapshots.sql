@@ -1,11 +1,11 @@
--- Net worth trend chart. Unlike per-account balance history
--- (accountHistory.js), net worth can't be reconstructed purely from
--- expenses/account_activity - a STANDALONE asset/liability (investment,
--- property, vehicle, retirement types, standalone loans) has no delta
--- trail at all, since editing one writes straight to value/balance with
--- no account_activity row (only account-linked ones get that). A real
--- snapshot table is genuinely necessary here, unlike per-account balance
--- history's case.
+-- Net worth trend chart. Unlike
+-- per-account balance history (accountHistory.js), net worth can't be
+-- reconstructed purely from expenses/account_activity - a STANDALONE
+-- asset/liability (investment, property, vehicle, retirement types,
+-- standalone loans) has no delta trail at all, since editing one writes
+-- straight to value/balance with no account_activity row (only
+-- account-linked ones get that). A real snapshot table is genuinely
+-- necessary here, unlike item 4's case.
 --
 -- Populated client-side, once per calendar day, on app load
 -- (snapshotNetWorthIfNeeded, app.js) - no cron/server trigger exists for

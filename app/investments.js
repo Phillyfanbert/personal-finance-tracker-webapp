@@ -146,3 +146,198 @@ export function allocationVsTarget(assets, holdings, targets) {
     return { bucket: t.bucket, currentValue, currentPct, targetPercent, gapDollars };
   });
 }
+
+/**
+ * Annual contribution-limit usage per group, for the groups the user
+ * actually has a qualifying account in (a group with zero matching assets
+ * is omitted entirely, not shown as "$0 of $X" - not every account type
+ * is tracked here, and some types share one limit while others have
+ * their own).
+ *
+ * limitGroups' shape (keyed by group id, defined in app.js as
+ * CONTRIBUTION_LIMIT_GROUPS - kept out of this pure module, same as
+ * INVESTMENT_ASSET_TYPES/ACCOUNT_TYPES already are, since the groups are
+ * app-level configuration, not a calculation this module owns):
+ *   { [groupId]: { types: string[], limit: number, label: string } }
+ *
+ * A contribution counts toward a group if its account_activity row has
+ * kind 'contribution', its asset_id resolves to an asset whose type is in
+ * that group, and its occurred_at falls in the given year - deliberately
+ * NOT "any balance increase," which would double-count ordinary market
+ * gains as if they were new money (the entire reason 'contribution' exists
+ * as its own account_activity kind rather than reusing asset_adjust).
+ *
+ * @param {object[]} assets every asset (used to map an asset id -> its type)
+ * @param {object[]} contributionActivity account_activity rows with kind 'contribution'
+ * @param {Object} limitGroups CONTRIBUTION_LIMIT_GROUPS from app.js
+ * @param {Date} [today]
+ */
+export function contributionLimitUsage(assets, contributionActivity, limitGroups, today = new Date()) {
+  const year = String(today.getFullYear());
+  const typeById = new Map(assets.map((a) => [a.id, a.type]));
+  const results = [];
+  for (const [groupId, group] of Object.entries(limitGroups)) {
+    const hasQualifyingAsset = assets.some((a) => group.types.includes(a.type));
+    if (!hasQualifyingAsset) continue;
+    const contributed = r2(
+      contributionActivity
+        .filter((row) => group.types.includes(typeById.get(row.asset_id)))
+        .filter((row) => (row.occurred_at || "").startsWith(year))
+        .reduce((sum, row) => sum + Number(row.amount || 0), 0)
+    );
+    results.push({
+      groupId,
+      label: group.label,
+      limit: group.limit,
+      contributed,
+      remaining: r2(group.limit - contributed),
+      overLimit: contributed > group.limit,
+    });
+  }
+  return results;
+}
+
+// A bucket counts as "off target" once it drifts this many percentage
+// points from its own target - same "flag it before it's actually over,
+// not just after" shape as budgets.js's WARN_THRESHOLD_PCT, applied to
+// allocation drift instead of budget overspend.
+export const ALLOCATION_DRIFT_WARN_PCT = 5;
+
+// A contribution group counts as "approaching" its limit at 90% used, not
+// just once actually over - same threshold and reasoning as budgets.js's
+// WARN_THRESHOLD_PCT.
+const CONTRIBUTION_APPROACHING_PCT = 90;
+
+/**
+ * Compiles the numbers already computed elsewhere on the Investments tab
+ * (portfolioTotals, allocationVsTarget, contributionLimitUsage, and the
+ * per-holding price data from investmentHoldings) into a short list of
+ * status lines for the "Daily health check" card at the top of the tab.
+ * Deliberately a compilation of real, already-computed facts - never a
+ * fabricated composite score. Same boundary already drawn for
+ * the Liabilities card's credit-utilization line: real math shown back to
+ * the user, not an invented number presented as authoritative.
+ *
+ * Returns raw structured data, not formatted strings - app.js does the
+ * fmt()/esc()/text-assembly, same separation portfolioTotals/
+ * allocationVsTarget/contributionLimitUsage already keep between
+ * calculation and presentation. Each line has a `tone` of 'ok' (green),
+ * 'warn' (needs attention), or 'neutral' (no data yet / nothing to flag) -
+ * a UI hint only, callers pick the actual color.
+ *
+ * A line is omitted entirely (not shown with a "no data" placeholder) when
+ * its underlying section has nothing to compile from at all (no allocation
+ * targets set, no contribution tracking, no ticker holdings) - same
+ * "omit rather than fake a zero" rule contributionLimitUsage itself
+ * already follows for a group with no qualifying account.
+ *
+ * @param {object} totals from portfolioTotals()
+ * @param {object[]} allocation from allocationVsTarget()
+ * @param {object[]} limitUsage from contributionLimitUsage()
+ * @param {object[]} holdings from investmentHoldings()
+ */
+export function portfolioHealthSummary(totals, allocation, limitUsage, holdings) {
+  const lines = [];
+
+  lines.push(totals.todayChange != null
+    ? { kind: "today", tone: totals.todayChange >= 0 ? "ok" : "warn", value: totals.totalValue, change: totals.todayChange, changePct: totals.todayChangePct }
+    : { kind: "today", tone: "neutral", value: totals.totalValue, change: null, changePct: null });
+
+  lines.push(totals.totalGainLoss != null
+    ? { kind: "gainLoss", tone: totals.totalGainLoss >= 0 ? "ok" : "warn", gainLoss: totals.totalGainLoss, gainLossPct: totals.totalGainLossPct }
+    : { kind: "gainLoss", tone: "neutral", gainLoss: null, gainLossPct: null });
+
+  // Only the single furthest-off-target bucket, not the whole table - the
+  // full breakdown already has its own card/chart further down the page.
+  if (allocation.length) {
+    const worst = allocation.reduce((a, b) =>
+      Math.abs(b.currentPct - b.targetPercent) > Math.abs(a.currentPct - a.targetPercent) ? b : a
+    );
+    const drift = r2(worst.currentPct - worst.targetPercent);
+    lines.push({
+      kind: "allocation",
+      tone: Math.abs(drift) >= ALLOCATION_DRIFT_WARN_PCT ? "warn" : "ok",
+      bucket: worst.bucket,
+      drift,
+    });
+  }
+
+  if (limitUsage.length) {
+    const overCount = limitUsage.filter((u) => u.overLimit).length;
+    const approachingCount = limitUsage.filter(
+      (u) => !u.overLimit && u.limit > 0 && (u.contributed / u.limit) * 100 >= CONTRIBUTION_APPROACHING_PCT
+    ).length;
+    lines.push({
+      kind: "contributions",
+      tone: overCount || approachingCount ? "warn" : "ok",
+      overCount,
+      approachingCount,
+      groupCount: limitUsage.length,
+    });
+  }
+
+  // Only meaningful once at least one ticker holding exists - a portfolio
+  // of purely blended/symbol-less accounts (a plain 401(k) with no
+  // per-ticker detail) has no live-pricing concept to report on at all.
+  if (holdings.length) {
+    const priced = holdings.filter((h) => h.latestPrice != null).length;
+    lines.push({
+      kind: "pricing",
+      tone: priced === holdings.length ? "ok" : "neutral",
+      priced,
+      total: holdings.length,
+    });
+  }
+
+  return lines;
+}
+
+/**
+ * Daily overview of a fixed set of major market indexes (S&P 500, NASDAQ,
+ * ...) - genuinely NOT tied to anything the user owns, unlike every other
+ * function in this module. Same day-over-day shape as investmentHoldings
+ * (reuses dailyFindingsForSymbol), just against market_index_findings and
+ * a fixed label list (app.js's MARKET_INDEXES) instead of each user's own
+ * assets.price_symbol. An index with no finding yet (the price-agent
+ * hasn't run, or hasn't found this particular one yet) still gets a row
+ * back with price/change left null, rather than being dropped - callers
+ * show a per-row "not available yet" state, same graceful-degradation
+ * posture the rest of this dormant pipeline already has.
+ * @param {string[]} indexes MARKET_INDEXES from app.js
+ * @param {object[]} findings rows from market_index_findings
+ */
+export function marketIndexSummary(indexes, findings) {
+  return indexes.map((label) => {
+    const days = dailyFindingsForSymbol(findings, label.toUpperCase());
+    const latest = days.length ? days[days.length - 1][1] : null;
+    const prior = days.length > 1 ? days[days.length - 2][1] : null;
+
+    const price = latest ? Number(latest.price) : null;
+    const priorPrice = prior ? Number(prior.price) : null;
+    const change = price != null && priorPrice != null ? r2(price - priorPrice) : null;
+    const changePct = change != null ? pct(change, priorPrice) : null;
+
+    return { label, price, change, changePct, explanation: latest?.explanation || null };
+  });
+}
+
+/**
+ * Today's biggest movers from a fixed stock watchlist (app.js's
+ * MARKET_MOVERS_WATCHLIST) - same "public market data, not tied to any
+ * user" category as marketIndexSummary above, and literally reuses it
+ * (the watchlist is just another label list against the same findings)
+ * rather than re-deriving price/change math a second time. Ranked by the
+ * size of the move regardless of direction, so a big drop shows up here
+ * just as readily as a big gain. A symbol with no day-over-day change yet
+ * (price-agent has only found it once so far, or not at all) has nothing
+ * to rank it by, so it's excluded rather than sorted in as a false 0%.
+ * @param {string[]} watchlist MARKET_MOVERS_WATCHLIST from app.js
+ * @param {object[]} findings rows from market_index_findings
+ * @param {number} n how many movers to return
+ */
+export function topMarketMovers(watchlist, findings, n = 3) {
+  return marketIndexSummary(watchlist, findings)
+    .filter((m) => m.changePct != null)
+    .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
+    .slice(0, n);
+}

@@ -2,8 +2,8 @@
 # ============================================================================
 # F6 stretch - brings SearXNG up, runs the deal-search agent, tears SearXNG
 # back down. Run on the SERVER MACHINE only. This is the script to point a
-# weekly cron/systemd timer at - not the raw node command - so SearXNG
-# never sits resident between runs.
+# weekly cron/systemd timer at (Phase D) - not the raw node command - so
+# SearXNG never sits resident between runs.
 #
 # Usage:
 #   ./tools/run-deal-agent.sh

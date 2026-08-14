@@ -2,10 +2,11 @@
 -- since 07_assets_liabilities.sql, but nothing ever actually bumped them
 -- on UPDATE - both columns have silently just stayed pinned to creation
 -- time forever. Needed correctly now for the Assets card's staleness
--- nudge, which measures "how long since this value was last touched" -
--- a DB trigger, not app-code, so it holds regardless of which client
--- makes the change, same reasoning behind the account/asset/liability
--- delete-cascade triggers elsewhere in this schema.
+-- nudge, which measures "how long since this
+-- value was last touched" - a DB trigger, not app-code, so it holds
+-- regardless of which client makes the change - the same reasoning
+-- already applied to the account/asset/liability
+-- delete-cascade triggers.
 create or replace function touch_updated_at()
 returns trigger
 language plpgsql

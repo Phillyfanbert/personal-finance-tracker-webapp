@@ -1,5 +1,5 @@
--- Per-category budgets. A single ongoing monthly limit per category, not
--- a per-month-varying budget -
+-- Per-category budgets. A single
+-- ongoing monthly limit per category, not a per-month-varying budget -
 -- the simpler "I want to spend no more than $X/month on Food" model,
 -- applied every month until changed, matching how most simple budgeting
 -- tools work. unique(user_id, category) - at most one budget per category.

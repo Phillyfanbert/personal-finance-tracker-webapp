@@ -22,8 +22,21 @@ function profileContext(profile) {
   return { employment_status, housing_status, household_size, dependents, financial_goals };
 }
 
-/** Build the context object sent to Gemma for a spending question. */
-export function buildQaContext(expenses, subscriptions, months = 6, profile = null) {
+/**
+ * Build the context object sent to Gemma for a spending question.
+ * @param {object[]} expenses
+ * @param {object[]} subscriptions
+ * @param {number} months
+ * @param {object|null} profile
+ * @param {object[]} relevantHistory older transactions (outside `months`)
+ *   found via app.js's retrieveRelevantHistory() - a vector search against
+ *   expense_embeddings (supabase/45_expense_embeddings.sql) scoped to
+ *   whatever's semantically relevant to the specific question asked.
+ *   Passed in already-fetched rather than fetched here, since this
+ *   function stays pure/synchronous - see that migration's header for why
+ *   this augments the recent-window data below rather than replacing it.
+ */
+export function buildQaContext(expenses, subscriptions, months = 6, profile = null, relevantHistory = []) {
   const recentMonths = lastMonths(months);
   const since = recentMonths[0] + "-01";
   const inRange = expenses.filter((e) => (e.occurred_at || "") >= since);
@@ -60,6 +73,7 @@ export function buildQaContext(expenses, subscriptions, months = 6, profile = nu
     subscriptions_monthly_total: totalMonthly(subscriptions),
     transactions,
     transactions_truncated: inRange.length > MAX_TRANSACTIONS,
+    relevant_history: relevantHistory,
     profile: profileContext(profile),
   };
 }

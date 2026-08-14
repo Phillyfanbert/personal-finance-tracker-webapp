@@ -1,5 +1,5 @@
--- Vehicle depreciation (a flat-rate formula, not a search agent). All
--- nullable - an asset with no
+-- Vehicle depreciation (Option A -
+-- a formula, not a search agent). All nullable - an asset with no
 -- purchase info just keeps behaving as it does today (a static,
 -- manually-set value). Net worth uses the live-computed estimate when
 -- all three are present (effectiveAssetValue, app/depreciation.js), not

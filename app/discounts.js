@@ -129,14 +129,15 @@ export function studentUpsell(subscriptions, catalog, profile) {
 }
 
 // Generalizes studentUpsell() above for the profile-expansion eligibility
-// fields - military, first_responder/healthcare, senior. Reuses
-// isEligible() rather than re-deriving each profile-field check, so this
-// and findDeals/isEligible can never silently disagree about what
-// "eligible" means for a given plan_type. Currently has no catalog data
-// to match against (seeding real researched prices was explicitly
-// deferred), so this returns [] in practice today; the mechanism is
-// complete and tested, it's just waiting on data, same shape
-// studentUpsell() itself was in before any student catalog rows existed.
+// fields - military,
+// first_responder/healthcare, senior. Reuses isEligible() rather than
+// re-deriving each profile-field check, so this and findDeals/isEligible
+// can never silently disagree about what "eligible" means for a given
+// plan_type. Currently has no catalog data to match against (seeding real
+// researched prices was explicitly deferred), so this
+// returns [] in practice today; the mechanism is complete and tested, it's
+// just waiting on data, same shape studentUpsell() itself was in before
+// any student catalog rows existed.
 const UPSELLABLE_PLAN_TYPES = ["military", "first_responder", "healthcare", "senior"];
 
 export function eligibilityUpsells(subscriptions, catalog, profile) {

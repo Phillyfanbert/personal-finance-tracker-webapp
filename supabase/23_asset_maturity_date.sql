@@ -1,5 +1,5 @@
--- CD maturity date. Lives on `assets`, not `accounts` - a CD's maturity
--- is a property of the financial instrument
+-- CD maturity date. Lives on `assets`, not
+-- `accounts` - a CD's maturity is a property of the financial instrument
 -- itself, and assets is the table that tracks it long-term (the same
 -- table already used for every other manually-valued asset type). No
 -- CHECK tying it to type = 'cd' - nothing stops setting it on another

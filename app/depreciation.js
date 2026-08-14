@@ -1,7 +1,5 @@
 // ============================================================================
-// Vehicle depreciation: a flat annual rate compounded continuously by
-// elapsed time, chosen over a per-year step function so it moves smoothly
-// day to day instead of jumping once a year.
+// Vehicle depreciation (Option A).
 // Pure, unit-testable - same style as networth.js/subscriptions.js.
 // ============================================================================
 

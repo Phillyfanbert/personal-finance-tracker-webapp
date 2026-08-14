@@ -1,7 +1,6 @@
 -- ============================================================================
--- F6 stretch - official-domain allowlist for the live deal-search agent.
--- Deliberate design decision: never guess a domain to search - only look
--- up services that have an explicit, curated entry here.
+-- F6 stretch - official-domain allowlist for the live deal-search agent
+-- (the "Option C" design decision).
 --
 -- Pure operational config for the home-machine agent - the PWA never reads
 -- this table. RLS is enabled with NO policies at all (default deny), so even

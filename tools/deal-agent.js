@@ -12,8 +12,8 @@
 //
 // What it does, per active-subscription service:
 //   1. Look up the service's allowlisted domain(s) in service_domains. No
-//      entry -> skip and log (a deliberate decision - never guess a
-//      domain).
+//      entry -> skip and log (the Option C
+//      decision - we never guess a domain).
 //   2. Query SearXNG with a handful of angles (pricing, student, promo,
 //      annual, family) and keep only results on an allowlisted domain.
 //   3. Fetch each surviving page's text and ask Gemma to extract a plan as
@@ -40,10 +40,10 @@
 // the extraction loop, and why Gemma calls get a longer timeout than the
 // SearXNG/page-fetch calls (see GEMMA_TIMEOUT_MS below).
 //
-// Scheduling: not wired up yet - run this weekly via your own cron/systemd
-// timer, not continuously. Prices don't change fast enough to justify the
-// compute, and hammering SearXNG risks getting upstream engines to
-// rate-limit or block it.
+// Scheduling (Phase D, not yet wired up): run this weekly via cron/systemd
+// timer, not continuously - prices don't change fast enough to
+// justify the compute, and hammering SearXNG risks getting upstream engines
+// to rate-limit or block it.
 // ============================================================================
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
