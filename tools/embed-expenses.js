@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // ============================================================================
 // Expense embeddings for RAG retrieval (Reports page's "Ask about your
-// spending" Q&A, docs/... see supabase/45_expense_embeddings.sql). Same
+// spending" Q&A - see supabase/45_expense_embeddings.sql). Same
 // architecture as tools/price-agent.js, reused rather than duplicated - runs
 // on the SERVER MACHINE ONLY, alongside Ollama. Never runs in the browser,
 // never ships in the PWA, needs the Supabase SERVICE_ROLE key - keep that

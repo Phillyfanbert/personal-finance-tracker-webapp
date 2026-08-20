@@ -53,6 +53,38 @@ export function monthlyTotals(expenses, months) {
   return months.map((m) => Math.round(map[m] * 100) / 100);
 }
 
+/**
+ * Per-month income vs. expense totals plus a savings rate, for the
+ * Reports page's "Income vs. expense" card. `incomeActivity` is
+ * `account_activity` rows already filtered to `kind === "income"` (the
+ * caller's job, same as `monthlyTotals` above expects already-filtered
+ * `expenses`, not raw `account_activity`). Expense totals reuse
+ * `monthlyTotals` directly rather than re-summing - one source of truth
+ * for "how is a month's expense total computed" between this card and
+ * every other Reports chart.
+ * @returns [{month, income, expense, savingsRate}] - savingsRate is
+ *   `(income - expense) / income`, or null when income is 0 (nothing to
+ *   divide by, not a real 0% or negative rate worth stating).
+ */
+export function incomeVsExpense(incomeActivity, expenses, months) {
+  const incomeMap = Object.fromEntries(months.map((m) => [m, 0]));
+  for (const a of incomeActivity) {
+    const ym = (a.occurred_at || "").slice(0, 7);
+    if (ym in incomeMap) incomeMap[ym] += Number(a.amount || 0);
+  }
+  const expenseTotals = monthlyTotals(expenses, months);
+  return months.map((m, i) => {
+    const income = Math.round(incomeMap[m] * 100) / 100;
+    const expense = expenseTotals[i];
+    return {
+      month: m,
+      income,
+      expense,
+      savingsRate: income > 0 ? Math.round(((income - expense) / income) * 1000) / 1000 : null,
+    };
+  });
+}
+
 // ---- Chart.js rendering ----------------------------------------------------
 const PALETTE = [
   "#38bdf8", "#34d399", "#fbbf24", "#f87171", "#a78bfa",
@@ -127,17 +159,35 @@ export function renderLineChart(canvas, labels, values) {
   });
 }
 
-export function renderTrendBar(canvas, months, totals) {
-  destroy("trend");
-  _charts["trend"] = new Chart(canvas, {
+/**
+ * Single-series month-over-month bar chart (the original, unchanged
+ * shape - "Last 6 months" on Reports). `secondDataset`, when given
+ * (`{label, data, color}`), adds a second bar per month for a paired
+ * comparison (income vs. expense) - the only case that needs a legend at
+ * all, since a single series is unambiguous without one. Registry key
+ * switched from a hardcoded "trend" to `canvas.id` so a second chart
+ * using this same function (a different canvas) doesn't clobber the
+ * first one's Chart.js instance on redraw - purely internal, no caller
+ * ever referenced the old literal key.
+ */
+export function renderTrendBar(canvas, months, totals, secondDataset = null) {
+  destroy(canvas.id);
+  const datasets = [{
+    label: secondDataset ? "Expense" : undefined,
+    data: totals, backgroundColor: "#0ea5e9", borderRadius: 6,
+  }];
+  if (secondDataset) {
+    datasets.push({
+      label: secondDataset.label, data: secondDataset.data,
+      backgroundColor: secondDataset.color || "#34d399", borderRadius: 6,
+    });
+  }
+  _charts[canvas.id] = new Chart(canvas, {
     type: "bar",
-    data: {
-      labels: months.map(monthLabel),
-      datasets: [{ data: totals, backgroundColor: "#0ea5e9", borderRadius: 6 }],
-    },
+    data: { labels: months.map(monthLabel), datasets },
     options: {
       responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
+      plugins: { legend: { display: !!secondDataset, labels: { color: TEXT } } },
       scales: {
         x: { ticks: { color: TEXT }, grid: { display: false } },
         y: { ticks: { color: TEXT, callback: (v) => "$" + v }, grid: { color: GRID } },

@@ -21,6 +21,13 @@ const r2 = (n) => Math.round(n * 100) / 100;
  *    (-amount, less owed on a liability account) - never both for the same
  *    row, since a funding account is always asset-linked and a debt
  *    account is always liability-linked.
+ *  - `transfer` activity between two of the user's own asset-backed
+ *    accounts - -amount on the funding side (account_id), +amount on the
+ *    receiving side (related_account_id), never both for the same row.
+ *  - `income` activity received into this account - a single-sided
+ *    +amount, unlike transfer/liability_payment (income has no "other
+ *    side" - it's new money arriving, not moving between two of the
+ *    user's own accounts).
  * A standalone liability (no linked account, manual "Owed" editing) never
  * reaches this function at all - it isn't in `accounts`, so it's out of
  * scope for a per-*account* history by construction.
@@ -49,6 +56,11 @@ export function buildBalanceHistory(account, currentBalance, expenses, accountAc
       } else if (a.kind === "liability_payment") {
         if (a.account_id === account.id) add(a.occurred_at, -Number(a.amount)); // funded from here
         if (a.related_account_id === account.id) add(a.occurred_at, -Number(a.amount)); // debt paid down
+      } else if (a.kind === "transfer") {
+        if (a.account_id === account.id) add(a.occurred_at, -Number(a.amount)); // money left from here
+        if (a.related_account_id === account.id) add(a.occurred_at, Number(a.amount)); // money arrived here
+      } else if (a.kind === "income" && a.account_id === account.id) {
+        add(a.occurred_at, Number(a.amount));
       }
     }
   }

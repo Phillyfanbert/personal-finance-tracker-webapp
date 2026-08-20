@@ -36,7 +36,7 @@ window.APP_CONFIG = {
   // this app's own source.
   GEMMA_AUTH_KEY: "",
 
-  // F6 stretch - live deal discovery.
+  // Live deal discovery - a background search agent.
   // Off by default: the deal_findings table stays dormant until you stand up
   // the home-machine search agent (Phase B/C of the proposal). Flip to true
   // once you're ready to surface machine-found (unverified) deals in the UI.

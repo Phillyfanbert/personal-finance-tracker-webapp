@@ -37,3 +37,21 @@ export function computeNetWorth(assets, debts) {
     netWorth: r2(assetsTotal - liabilitiesTotal),
   };
 }
+
+/**
+ * Months of average spending covered by liquid assets. Deliberately no
+ * color threshold or "aim for 3-6 months" framing here - the same
+ * restraint the Liabilities card's credit-utilization line already
+ * holds (a real, commonly-cited guideline, but stating it would cross
+ * from showing the math into advice). Callers render this as a plain
+ * number, nothing more.
+ * @param {number} liquidAssetsTotal
+ * @param {number} avgMonthlySpending
+ * @returns {number|null} null when there's no spending to divide by (a
+ *   0 or negative average would be a divide-by-zero/nonsensical result,
+ *   not a real "infinite runway").
+ */
+export function emergencyFundCoverage(liquidAssetsTotal, avgMonthlySpending) {
+  if (!(avgMonthlySpending > 0)) return null;
+  return Math.round((liquidAssetsTotal / avgMonthlySpending) * 10) / 10;
+}

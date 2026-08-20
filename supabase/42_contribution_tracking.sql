@@ -1,5 +1,6 @@
 -- ============================================================================
--- Contribution-limit tracking for investment accounts.
+-- Contribution-limit tracking for investment accounts (docs/bank-account-
+-- types-research.md §9b.6).
 --
 -- 'contribution' - a new account_activity kind for money added to an
 -- investment account that the user explicitly logged as a contribution

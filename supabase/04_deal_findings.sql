@@ -1,5 +1,5 @@
 -- ============================================================================
--- F6 stretch - live deal discovery.
+-- Live deal discovery - a background search agent.
 -- Run this after 01-03. Optional: the app works fine with this table empty
 -- or unapplied until the home-machine search agent exists (Phase B/C).
 --

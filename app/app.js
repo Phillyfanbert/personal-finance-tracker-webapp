@@ -6,15 +6,15 @@
 // ============================================================================
 import { categorize, quickParse, CATEGORIES } from "./categorize.js";
 import {
-  monthKey, monthLabel, lastMonths, sumBy, monthlyTotals,
+  monthKey, monthLabel, lastMonths, sumBy, monthlyTotals, incomeVsExpense,
   renderBreakdownBar, renderTrendBar, renderLineChart,
 } from "./charts.js";
 import { buildBalanceHistory } from "./accountHistory.js";
 import { estimateValue, effectiveAssetValue } from "./depreciation.js";
-import { payoffProjection } from "./payoff.js";
+import { payoffProjection, compareDebtStrategies } from "./payoff.js";
 import { cycleDates, cycleStatus } from "./creditCycle.js";
 import { budgetStatus } from "./budgets.js";
-import { investmentHoldings, portfolioTotals, allocationVsTarget, contributionLimitUsage, portfolioHealthSummary, marketIndexSummary, topMarketMovers } from "./investments.js";
+import { investmentHoldings, portfolioTotals, allocationVsTarget, contributionLimitUsage, portfolioHealthSummary, marketIndexSummary, topMarketMovers, latestNewsDigest, latestFinnhubRefresh, marketBreadth, marketStatus, latestRecap } from "./investments.js";
 import { ALL_SECURITY_TICKERS, CRYPTO_SYMBOLS } from "./tickers.js";
 import {
   guessColumnMapping, guessSignConvention, normalizeRow, isLikelyDuplicate,
@@ -24,10 +24,12 @@ import {
   monthlyAmount, totalMonthly, daysUntil, upcomingRenewals, renewalLabel, advanceRenewal,
   detectRecurringExpenses,
 } from "./subscriptions.js";
+import { advanceIncomeDate } from "./income.js";
+import { forecastCashFlow } from "./cashflow.js";
 import { findDeals, studentUpsell, eligibilityUpsells, matchService } from "./discounts.js";
 import { parseWithGemma, askGemma, warmUpGemma, embedText } from "./gemma.js";
 import { buildQaContext } from "./insights.js";
-import { computeNetWorth } from "./networth.js";
+import { computeNetWorth, emergencyFundCoverage } from "./networth.js";
 import { BANK_NAMES } from "./bankNames.js";
 
 const { SUPABASE_URL, SUPABASE_ANON_KEY, GEMMA_ENDPOINT, GEMMA_MODEL, GEMMA_EMBED_MODEL, GEMMA_AUTH_KEY, DEAL_FINDINGS_ENABLED, PRICE_FINDINGS_ENABLED } = window.APP_CONFIG || {};
@@ -61,7 +63,7 @@ function toast(msg) {
   const t = $("toast"); t.textContent = msg; t.classList.add("show");
   setTimeout(() => t.classList.remove("show"), 2200);
 }
-// Generic red-border flag for a denied action (the "every denial
+// Generic red-border flag for a denied action (this app's "every denial
 // flags its field" rule) - call right before a `return toast(...)` that
 // rejects a save/action over one or more specific fields. Self-clearing:
 // the border comes off the moment the user next touches that exact field
@@ -130,10 +132,14 @@ let userRules = {};   // keyword -> category
 let accounts = [];
 let allExpenses = []; // cache for reports (last ~12 months)
 let subscriptions = []; // cache of the user's subscriptions
+let incomeSources = []; // cache of the user's recurring income sources
 let catalog = [];     // shared subscription_catalog reference data
-let dealFindings = []; // shared, machine-found deals (F6 stretch)
-let assetPriceFindings = []; // shared, machine-found asset prices
+let dealFindings = []; // shared, machine-found deals (a background search agent)
+let assetPriceFindings = []; // shared, machine-found asset prices (a background price agent)
 let marketIndexFindings = []; // shared, machine-found market index levels (Investments tab's Market overview)
+let marketNewsFindings = []; // shared, machine-found daily market news digest + sentiment (market_news_findings)
+let dailyRecaps = []; // stored zero-LLM daily market recaps (daily_recaps, 55_daily_recaps.sql)
+let agentRunStatus = {}; // { "deal-agent": {...}, "price-agent": {...} } - last-run freshness/health (agent_run_status)
 let budgets = []; // per-category monthly limits
 let budgetWarnings = []; // this month's budgetStatus() rows at/over WARN_THRESHOLD_PCT
 let investmentTargets = []; // per-bucket allocation targets (Investments tab)
@@ -142,6 +148,7 @@ let debts = [];        // tracked debts, i.e. rows in the `liabilities` table (L
 let accountActivity = []; // non-expense money movements (asset adjust, liability pay) - Recent History
 let editing = null;   // expense row currently in the edit modal
 let editingSub = null; // subscription row currently in the sub form
+let editingIncome = null; // income row currently in the income form
 let userId = null;    // signed-in user's uuid
 let userEmail = null; // signed-in user's email, shown read-only in Profile
 let profile = null;   // the user's profiles row
@@ -248,11 +255,26 @@ async function init() {
   // liabilities are account-linked (to hide their delete button), so it
   // needs a populated `accounts` to render correctly on first paint.
   await loadAccounts();
-  await Promise.all([loadRules(), loadProfile(), loadCatalog(), loadDealFindings(), loadAssetPriceFindings(), loadMarketIndexFindings(), loadAssets(), loadDebts(), loadAccountActivity(), loadBudgets(), loadInvestmentTargets()]);
-  await Promise.all([loadExpenses(), loadSubscriptions()]);
+  await Promise.all([loadRules(), loadProfile(), loadCatalog(), loadDealFindings(), loadAssetPriceFindings(), loadMarketIndexFindings(), loadMarketNewsFindings(), loadAgentRunStatus(), loadDailyRecaps(), loadAssets(), loadDebts(), loadAccountActivity(), loadBudgets(), loadInvestmentTargets()]);
+  // Both assets and assetPriceFindings are guaranteed loaded by the
+  // Promise.all above (no race) - this is what keeps Net Worth/the Assets
+  // card/the net-worth trend chart in sync with live prices on every app
+  // open, not just whenever someone happens to manually edit a holding.
+  await syncAllParentAssetValues();
+  await Promise.all([loadExpenses(), loadSubscriptions(), loadIncome()]);
   await autoLogDueSubscriptions();
+  await autoLogDueIncome();
   await snapshotNetWorthIfNeeded();
   await snapshotPortfolioIfNeeded();
+  // The two findings loaders above already pulled a headline batch, so the
+  // slower headline cadence starts from here rather than firing again on
+  // the very first tick.
+  lastHeadlineRefresh = Date.now();
+  startLiveRefresh();
+  // Not awaited: the live overlay is a best-effort enhancement on top of
+  // data that's already rendered, so app startup shouldn't wait on a
+  // round-trip to /api/quotes to finish.
+  refreshLivePrices();
 }
 
 // Every user gets exactly one Cash account + linked Cash asset, auto-created
@@ -280,6 +302,153 @@ async function loadDealFindings() {
   dealFindings = data || [];
 }
 
+// Last-run health for deal-agent.js/price-agent.js (agent_run_status,
+// migration 48) - loaded unconditionally (cheap, at most 2 rows) rather
+// than gated by DEAL_FINDINGS_ENABLED/PRICE_FINDINGS_ENABLED, since the
+// render functions that use it already check those flags themselves
+// before showing anything. Previously a rate-limited or failed agent run
+// was completely invisible to anyone without SSH access to the server
+// machine's raw log file - this is what actually surfaces that to a
+// signed-in user instead. Re-renders both dependent cards on its own
+// completion (same "whichever parallel load finishes last wins" pattern
+// loadAssetPriceFindings() already documents) since loadDealFindings()/
+// loadSubscriptions()/loadMarketIndexFindings() all run in parallel with
+// this and each also trigger their own render of the same cards.
+async function loadAgentRunStatus() {
+  const { data } = await sb.from("agent_run_status").select("*");
+  agentRunStatus = {};
+  for (const row of data || []) agentRunStatus[row.agent] = row;
+  renderDealFindings();
+  renderMarketOverview();
+}
+
+function timeAgo(dateStr) {
+  const diffMs = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+// Shared by renderDealFindings()/renderMarketOverview() below - both
+// cards have an identical freshness-line + warning-banner shape, just
+// against a different agent name and pair of element ids.
+function renderAgentFreshness(agent, freshnessId, warningId) {
+  const status = agentRunStatus[agent];
+  const freshnessEl = $(freshnessId);
+  const warningEl = $(warningId);
+  if (!freshnessEl || !warningEl) return;
+
+  if (!status) {
+    freshnessEl.textContent = "";
+    warningEl.classList.add("hidden");
+    return;
+  }
+  freshnessEl.textContent = `Last updated ${timeAgo(status.ran_at)}`;
+
+  if (status.status === "ok" || !status.detail) {
+    warningEl.classList.add("hidden");
+  } else {
+    warningEl.classList.remove("hidden");
+    warningEl.style.color = status.status === "failed" ? "var(--err)" : "var(--warn)";
+    warningEl.textContent = status.detail; // .textContent, not innerHTML - no esc() needed
+  }
+}
+
+// Deliberately separate from renderAgentFreshness above, which reflects
+// an AGENT RUN's status (the whole weekly Tavily/Gemini pipeline) - this
+// reflects the literal truth of the specific real-ticker prices on
+// screen, computed straight from their own found_at timestamps
+// (latestFinnhubRefresh, investments.js) rather than a job-level status
+// row. Matters once the two cadences diverge: "Prices as of 12 minutes
+// ago" (Finnhub, FAST_ONLY) and "Last updated 6 days ago" (indexes,
+// Tavily+Gemini) can both be true on the same card at once, and blending
+// them into one line would misstate one or the other.
+const PRICE_REFRESH_WARN_MINUTES = 30; // 2x the 15-min FAST_ONLY interval
+function renderPricesAsOf(elId, foundAt) {
+  const el = $(elId);
+  if (!el) return;
+  if (!foundAt) { el.textContent = ""; return; }
+  const { open } = marketStatus();
+  const minutesAgo = (Date.now() - new Date(foundAt).getTime()) / 60000;
+  // Outside the regular session a price many hours old is the correct,
+  // current fact - the last close really is the latest price there is.
+  // Warn-coloring it would flag ordinary overnight/weekend behavior as a
+  // problem, which is exactly what made this line look broken every
+  // evening. Only the CLOSED case is stated out loud; see marketStatus()'s
+  // own comment for why a wrong "closed" would be worse than silence.
+  el.textContent = open
+    ? `Prices as of ${timeAgo(foundAt)}`
+    : `Market closed - prices as of ${timeAgo(foundAt)}`;
+  el.style.color = open && minutesAgo > PRICE_REFRESH_WARN_MINUTES ? "var(--warn)" : "";
+}
+
+// Only the columns something on this page actually reads, never select("*").
+// source_query/raw_snippet/confidence/expires_at/id are never touched
+// client-side for these two tables, and `headlines` is fetched separately
+// by fetchLatestHeadlines() below rather than inline - see its comment for
+// why pulling it with the price rows costs far more than it looks.
+const PRICE_FINDING_COLS = "symbol,price,found_at,explanation,extracted_by";
+// renderAssetPriceFindings() additionally shows a source link and currency.
+const ASSET_PRICE_FINDING_COLS = `${PRICE_FINDING_COLS},url,currency`;
+
+// A findings row is uniquely identified by symbol + found_at (each agent run
+// writes one row per symbol), so dedup needs no id column of its own -
+// which is the point, since id is a 36-byte uuid on every one of ~4,600 rows.
+const findingKey = (r) => `${r.symbol}|${r.found_at}`;
+// Matches the tables' own `expires_at` default (found_at + 2 days) so a
+// session left open for days keeps the in-memory array bounded the same way
+// the server-side query already bounds the fetch.
+const FINDINGS_RETENTION_MS = 2 * 24 * 60 * 60 * 1000;
+
+// Merges any number of findings lists into one deduped, still-fresh array.
+// A row carrying `headlines` wins over the same row without it, since the
+// price query deliberately omits that column.
+function mergeFindings(...lists) {
+  const cutoff = new Date(Date.now() - FINDINGS_RETENTION_MS).toISOString();
+  const byKey = new Map();
+  for (const list of lists) {
+    for (const row of list) {
+      if (row.found_at && row.found_at < cutoff) continue;
+      const existing = byKey.get(findingKey(row));
+      if (!existing || (row.headlines && !existing.headlines)) byKey.set(findingKey(row), row);
+    }
+  }
+  return [...byKey.values()];
+}
+
+// `since` is what makes refreshLivePrices() cheap: a tick asks only for
+// rows newer than the newest one already in memory (~25 rows) instead of
+// re-running the full 2-day query. Narrowing by found_at on the INITIAL
+// load would have been a no-op - expires_at (found_at + 2 days) already
+// bounds that history, and the row count comes from the FAST_ONLY run
+// writing all ~24 symbols every 15 minutes, not from a long tail.
+async function fetchFindings(table, cols, since = null) {
+  let q = sb.from(table).select(cols).gt("expires_at", new Date().toISOString());
+  if (since) q = q.gt("found_at", since);
+  const { data } = await q;
+  return data || [];
+}
+
+// tools/price-agent.js writes headlines on roughly 1 of every 4 FAST_ONLY
+// runs (shouldFetchNewsThisRun()) for every symbol at once, so a 2-day
+// window holds ~950 near-duplicate copies of a blob - over half the whole
+// payload - when latestHeadlinesForSymbol() only ever displays the newest
+// per symbol. Taking the most recent few batches instead gets an identical
+// render for a fraction of the bytes.
+const HEADLINE_ROW_LIMIT = 60;
+async function fetchLatestHeadlines(table, cols) {
+  const { data } = await sb.from(table).select(`${cols},headlines`)
+    .not("headlines", "is", null)
+    .gt("expires_at", new Date().toISOString())
+    .order("found_at", { ascending: false })
+    .limit(HEADLINE_ROW_LIMIT);
+  return data || [];
+}
+
 // Dormant until PRICE_FINDINGS_ENABLED is flipped on (config.js) and
 // tools/price-agent.js starts writing rows.
 // Loads in parallel with loadAssets() (init()'s Promise.all), so this also
@@ -288,8 +457,11 @@ async function loadDealFindings() {
 // renderRecurringCandidates() already uses for its own two parallel loads.
 async function loadAssetPriceFindings() {
   if (!PRICE_FINDINGS_ENABLED) { assetPriceFindings = []; renderAssetPriceFindings(); return; }
-  const { data } = await sb.from("asset_price_findings").select("*").gt("expires_at", new Date().toISOString());
-  assetPriceFindings = data || [];
+  const [prices, headlines] = await Promise.all([
+    fetchFindings("asset_price_findings", ASSET_PRICE_FINDING_COLS),
+    fetchLatestHeadlines("asset_price_findings", ASSET_PRICE_FINDING_COLS),
+  ]);
+  assetPriceFindings = mergeFindings(prices, headlines);
   renderAssetPriceFindings();
 }
 
@@ -299,10 +471,201 @@ async function loadAssetPriceFindings() {
 // pipeline just writing to a different table for a fixed index list).
 async function loadMarketIndexFindings() {
   if (!PRICE_FINDINGS_ENABLED) { marketIndexFindings = []; renderMarketOverview(); return; }
-  const { data } = await sb.from("market_index_findings").select("*").gt("expires_at", new Date().toISOString());
-  marketIndexFindings = data || [];
+  const [prices, headlines] = await Promise.all([
+    fetchFindings("market_index_findings", PRICE_FINDING_COLS),
+    fetchLatestHeadlines("market_index_findings", PRICE_FINDING_COLS),
+  ]);
+  marketIndexFindings = mergeFindings(prices, headlines);
   renderMarketOverview();
 }
+
+// Same dormant-until-flag shape as loadMarketIndexFindings above, same
+// PRICE_FINDINGS_ENABLED flag - one switch for the whole dormant pipeline.
+async function loadMarketNewsFindings() {
+  if (!PRICE_FINDINGS_ENABLED) { marketNewsFindings = []; renderMarketOverview(); return; }
+  const { data } = await sb.from("market_news_findings").select("*").gt("expires_at", new Date().toISOString());
+  marketNewsFindings = data || [];
+  renderMarketOverview();
+}
+
+// The stored daily recap (daily_recaps). Unlike the findings loaders
+// above this is NOT gated by PRICE_FINDINGS_ENABLED: that flag gates the
+// live-pricing pipeline, and a recap is a different thing - it is built
+// entirely from data already in the database, makes no live call of its
+// own, and stays readable even if live pricing were switched off. Only a
+// handful of rows, newest first.
+const RECAP_HISTORY_DAYS = 30;
+async function loadDailyRecaps() {
+  const { data } = await sb.from("daily_recaps")
+    .select("trade_date,movers,breadth,index_moves,summary,generated_by")
+    .order("trade_date", { ascending: false })
+    .limit(RECAP_HISTORY_DAYS);
+  dailyRecaps = data || [];
+  renderDailyRecap();
+}
+
+// ---- LIVE PRICE REFRESH ----------------------------------------------------
+// tools/price-agent.js's FAST_ONLY run writes real Finnhub prices every 15
+// minutes, but init() read those tables exactly ONCE - so an installed
+// home-screen icon left open (which is the normal case here, not an edge
+// case: an iOS icon keeps its own storage container and a password session
+// stays signed in for days) kept showing whatever it fetched at the last
+// cold start. The data was never the stale part; the page was.
+//
+// Cheap by construction rather than by luck: a tick asks only for rows
+// newer than the newest already in memory (~25 rows, a few kB), so this
+// never re-runs the full initial 2-day query.
+const LIVE_REFRESH_MS = 60000;
+// Headlines land on only ~1 of every 4 agent runs and are much heavier per
+// row than a price, so they get their own slower cadence instead of riding
+// every tick.
+const HEADLINE_REFRESH_MS = 15 * 60 * 1000;
+let liveRefreshTimer = null;
+let lastHeadlineRefresh = 0;
+
+const newestFoundAt = (rows) =>
+  rows.reduce((max, r) => (r.found_at && (!max || r.found_at > max) ? r.found_at : max), null);
+
+function renderPriceDependentCards() {
+  renderAssetPriceFindings();
+  renderMarketOverview();
+  renderInvestments();
+}
+
+// ---- LIVE QUOTE OVERLAY ----------------------------------------------------
+// The findings tables are only ever as fresh as the server machine's
+// 15-minute FAST_ONLY run, which is a real dependency on one Mac being
+// awake. This asks worker.js's /api/quotes for the same symbols directly,
+// so the numbers on screen are current to the minute and keep working even
+// when that machine is off. The findings rows stay the fallback, and stay
+// the only source of what a live quote doesn't carry - the weekly Gemini
+// explanation and the real Finnhub headlines.
+//
+// Written into the SAME row shape the findings tables use, so every
+// existing render path picks a quote up as "today's latest finding" for
+// that symbol with no changes of its own. Tagged `live` so each tick
+// REPLACES the previous overlay rather than appending to it: the findings
+// tables are insert-only history on purpose, but this is a moving snapshot
+// of right now, not a series worth keeping. Nothing here is ever written
+// back to the database.
+const ownedPriceSymbols = () => [...new Set(
+  assets.filter((a) => a.price_symbol).map((a) => a.price_symbol.trim().toUpperCase())
+)];
+const indexPriceSymbols = () => [...new Set(
+  [...MARKET_MOVERS_WATCHLIST, ...Object.values(MARKET_INDEX_ETF_PROXIES)]
+)];
+
+async function fetchLiveQuotes(symbols) {
+  if (!symbols.length) return null;
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) return null;
+  try {
+    const res = await fetch(`/api/quotes?symbols=${encodeURIComponent(symbols.join(","))}`, {
+      headers: { Authorization: `Bearer ${session.access_token}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.quotes || null;
+  } catch {
+    return null;
+  }
+}
+
+// Two rows per symbol, not one. The live price is today's; Finnhub's own
+// `previousClose` rides along on the same call and becomes a synthetic
+// PRIOR-day row, which is what lets dailyFindingsForSymbol() derive an
+// exact day change with no changes to any pure function. Without it the
+// prior day would be whatever row the agent last happened to write, so a
+// day the server machine was off would silently be presented as "today's"
+// change against a two-day-old price.
+//
+// Stamped at the very end of the previous UTC day so it reliably wins that
+// day's bucket (dailyFindingsForSymbol keeps each day's LATEST row, and a
+// real agent row from late yesterday would otherwise outrank it).
+function liveQuoteRows(quotes, symbols, stamp) {
+  const prev = new Date(Date.parse(stamp) - 24 * 60 * 60 * 1000);
+  prev.setUTCHours(23, 59, 59, 999);
+  const prevStamp = prev.toISOString();
+  const rows = [];
+  for (const symbol of symbols) {
+    const quote = quotes[symbol];
+    if (!quote || quote.price == null) continue;
+    rows.push({ symbol, price: quote.price, found_at: stamp, extracted_by: "finnhub", live: true });
+    if (quote.previousClose != null) {
+      rows.push({ symbol, price: quote.previousClose, found_at: prevStamp, extracted_by: "finnhub", live: true });
+    }
+  }
+  return rows;
+}
+
+function applyLiveQuotes(quotes) {
+  const stamp = new Date().toISOString();
+  assetPriceFindings = mergeFindings(
+    assetPriceFindings.filter((r) => !r.live),
+    liveQuoteRows(quotes, ownedPriceSymbols(), stamp)
+  );
+  marketIndexFindings = mergeFindings(
+    marketIndexFindings.filter((r) => !r.live),
+    liveQuoteRows(quotes, indexPriceSymbols(), stamp)
+  );
+}
+
+// Best-effort throughout: a failed refresh leaves the last-known prices on
+// screen rather than blanking a card, the same non-fatal shape the loaders
+// above and retrieveRelevantHistory() already have.
+async function refreshLivePrices() {
+  if (!PRICE_FINDINGS_ENABLED || !userId || document.hidden) return;
+  // Market shut: no fetch at all, since a price genuinely cannot change
+  // between the close and the next open - a tick could only ever re-read
+  // the same last-close rows. Still re-renders, so the freshness lines
+  // pick up "Market closed" at the bell instead of only at the next
+  // navigation, and keep their "X ago" reading current.
+  if (!marketStatus().open) { renderPriceDependentCards(); return; }
+  try {
+    const wantHeadlines = Date.now() - lastHeadlineRefresh > HEADLINE_REFRESH_MS;
+    // newestFoundAt() is read BEFORE the overlay is reapplied below, and the
+    // overlay's own rows are excluded from it - a synthetic row stamped
+    // "now" would otherwise become the incremental cursor and permanently
+    // hide every real agent row written after it.
+    const assetSince = newestFoundAt(assetPriceFindings.filter((r) => !r.live));
+    const indexSince = newestFoundAt(marketIndexFindings.filter((r) => !r.live));
+    const [assetRows, indexRows, assetHeads, indexHeads, quotes] = await Promise.all([
+      fetchFindings("asset_price_findings", ASSET_PRICE_FINDING_COLS, assetSince),
+      fetchFindings("market_index_findings", PRICE_FINDING_COLS, indexSince),
+      wantHeadlines ? fetchLatestHeadlines("asset_price_findings", ASSET_PRICE_FINDING_COLS) : [],
+      wantHeadlines ? fetchLatestHeadlines("market_index_findings", PRICE_FINDING_COLS) : [],
+      fetchLiveQuotes([...new Set([...ownedPriceSymbols(), ...indexPriceSymbols()])]),
+    ]);
+    if (wantHeadlines) lastHeadlineRefresh = Date.now();
+    assetPriceFindings = mergeFindings(assetPriceFindings, assetRows, assetHeads);
+    marketIndexFindings = mergeFindings(marketIndexFindings, indexRows, indexHeads);
+    // Reapplied after the agent rows land, so the overlay always sits on
+    // top of the freshest stored data rather than being merged underneath.
+    if (quotes) applyLiveQuotes(quotes);
+    renderPriceDependentCards();
+  } catch {
+    // Leave the existing prices and their honest "as of" reading in place.
+  }
+}
+
+// Deliberately NOT scoped to the Investments view: the Log page's own
+// "Live asset prices" card reads the same rows, and an incremental tick is
+// cheap enough that gating it per-view would add branching for no real
+// saving. Restarted rather than stacked, since renderAuth() can run init()
+// again on a later auth-state change.
+function startLiveRefresh() {
+  if (liveRefreshTimer) clearInterval(liveRefreshTimer);
+  liveRefreshTimer = setInterval(refreshLivePrices, LIVE_REFRESH_MS);
+}
+
+// A background tab has its timers throttled hard, so returning to the app
+// after hours away needs its own immediate catch-up - this is the path that
+// actually matters for an installed icon, where "reopening" never reloads
+// the page.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshLivePrices();
+});
+
 // A blank "None" first option, not just the real categories - so a select
 // that's never been explicitly set (fCategory on a fresh Quick Add) starts
 // genuinely empty rather than silently defaulting to CATEGORIES[0] ("Food")
@@ -327,7 +690,7 @@ async function loadRules() {
 }
 
 // ---- ACCOUNTS --------------------------------------------------------------
-// Every account type as a single
+// Every supported account type, as a single
 // data-driven config instead of one hardcoded map per concern - adding a
 // new type later means adding one entry here, not touching five different
 // functions. `kind` decides whether saving this type auto-creates+links a
@@ -376,8 +739,9 @@ const ACCOUNT_TYPES = {
   // (a future withdrawal owes income tax, so the number shown overstates
   // what the money is actually worth) while a Roth balance is post-tax
   // (qualified withdrawals owe nothing, so the number is what you keep).
-  // Both still count into net worth at face value here - that's the
-  // honest default rather than applying a guessed tax haircut.
+  // Both still count into net worth at face value here, by design -
+  // real account-type research backs why this is the honest default
+  // rather than applying a guessed tax haircut.
   traditional_401k:       { label: "401(k) (Traditional)",        category: "Retirement & investment",  kind: "asset",     linkType: "traditional_401k" },
   roth_401k:              { label: "401(k) (Roth)",               category: "Retirement & investment",  kind: "asset",     linkType: "roth_401k" },
   plan_403b:              { label: "403(b)",                      category: "Retirement & investment",  kind: "asset",     linkType: "plan_403b" },
@@ -532,6 +896,22 @@ const INVESTMENT_BUCKETS = ["Stocks", "Bonds", "Cash", "Crypto", "Real Estate", 
 // to a row here) - that file has no import/export machinery to share this
 // list from a single source, so the two are kept in sync by hand.
 const MARKET_INDEXES = ["S&P 500", "Dow Jones Industrial Average", "NASDAQ Composite", "Russell 2000"];
+// A live, Gemini-free stand-in for the exact index-point number above -
+// added 2026-08-16 after confirming live that raw index tickers
+// (^GSPC/^DJI/^IXIC/^RUT) require a paid Finnhub subscription ("Market
+// data subscription required for CFD indices" - a real API response, not
+// an assumption), but these four highly liquid, widely-tracked ETFs work
+// on the free tier and closely track the same four indexes. Written to
+// market_index_findings under the ETF's OWN ticker as `symbol`
+// (tools/price-agent.js), deliberately never under the index's plain-
+// English label - mixing an ETF's dollar price into the same day-series
+// as the index's own point value would corrupt day-change math (a real,
+// ~10x scale difference, not a rounding nuance). QQQ tracks the
+// NASDAQ-100 specifically, not the full NASDAQ Composite - the closest
+// free, liquid option, labeled honestly as such rather than implied to
+// be an exact match. Must match tools/price-agent.js's own copy, kept in
+// sync by hand for the same reason MARKET_INDEXES already is.
+const MARKET_INDEX_ETF_PROXIES = { "S&P 500": "SPY", "Dow Jones Industrial Average": "DIA", "NASDAQ Composite": "QQQ", "Russell 2000": "IWM" };
 // A fixed, curated watchlist of well-known large-cap stocks (not each
 // user's own holdings) so the Investments tab can surface "today's biggest
 // movers" even for a user who holds nothing at all - same "public market
@@ -731,10 +1111,15 @@ $("acctType").onchange = () => setAcctType($("acctType").value);
 function closeAcctForm() {
   $("acctForm").classList.add("hidden");
 }
+function closeTransferForm() {
+  $("transferForm").classList.add("hidden");
+  $("transferAmount").value = "";
+}
 function closeAccountEditPanels() {
   closeAssetAdjust();
   closeDebtBalanceForm();
   closeDebtDetailsForm();
+  closeTransferForm();
 }
 $("addAcctBtn").onclick = () => {
   const opening = $("acctForm").classList.contains("hidden");
@@ -742,6 +1127,48 @@ $("addAcctBtn").onclick = () => {
   $("acctForm").classList.toggle("hidden");
   populateAcctTypeSelect();
   setAcctType("debit"); // every fresh open starts from the same visible state
+};
+$("transferBtn").onclick = () => {
+  const opening = $("transferForm").classList.contains("hidden");
+  if (opening) { closeAcctForm(); closeAccountEditPanels(); }
+  $("transferForm").classList.toggle("hidden");
+};
+$("transferCancelBtn").onclick = closeTransferForm;
+// Asset-to-asset only (see transferForm's own comment in index.html) -
+// reuses assetDeltaError/applyAssetDelta exactly as Quick Add already
+// does for an expense, just applied twice (once per leg) instead of
+// once, since a transfer is symmetric rather than expense-shaped.
+$("transferConfirmBtn").onclick = async () => {
+  const amount = parseFloat($("transferAmount").value);
+  if (!amount || amount <= 0) { flagField("transferAmount"); return toast("Enter a valid amount"); }
+  const fromId = $("transferFrom").value;
+  const toId = $("transferTo").value;
+  if (!fromId) { flagField("transferFrom"); return toast("Choose an account to transfer from"); }
+  if (!toId) { flagField("transferTo"); return toast("Choose an account to transfer to"); }
+  const fromAccount = accounts.find((a) => a.id === fromId);
+  const toAccount = accounts.find((a) => a.id === toId);
+  if (!fromAccount || !toAccount) { flagField(["transferFrom", "transferTo"]); return toast("Choose valid accounts"); }
+  // Compares the underlying ASSET, not just the account id - two accounts
+  // could in principle point at the same asset, and two applyAssetDelta
+  // calls against the same asset would net to zero silently instead of
+  // erroring.
+  if (fromAccount.linked_asset_id === toAccount.linked_asset_id) {
+    flagField(["transferFrom", "transferTo"]);
+    return toast("Choose two different accounts");
+  }
+  const err = assetDeltaError([{ accountId: fromId, amount, sign: -1 }]);
+  if (err) { flagField("transferFrom"); return toast(err); }
+
+  await applyAssetDelta(fromId, null, amount, -1);
+  await applyAssetDelta(toId, null, amount, +1);
+  await logActivity(
+    "transfer", `Transferred ${fmt(amount)} from ${acctName(fromId)} to ${acctName(toId)}`,
+    amount, undefined, fromId, toId
+  );
+  closeTransferForm();
+  await loadAssets();
+  renderRecentTransactions();
+  toast("Transfer recorded");
 };
 
 // bank_name is separate from linked_asset_id/linked_liability_id - it's
@@ -1016,6 +1443,21 @@ async function loadAccounts() {
   $("fAccount").innerHTML = opts;
   $("eAccount").innerHTML = opts;
   $("sAccount").innerHTML = opts;
+  $("holdingFundingAccount").innerHTML = opts;
+  // Deliberately NOT the spendable list above - Transfer needs an
+  // asset-backed account specifically (applyAssetDelta/assetDeltaError
+  // are silent no-ops for a credit/liability-linked one, which the
+  // spendable list above intentionally includes) - see transferForm's
+  // own comment in index.html for why this would otherwise be a real,
+  // silent balance-not-actually-changing bug.
+  const transferable = accounts.filter((a) => a.linked_asset_id && !a.archived_at);
+  const transferOpts = `<option value="">Choose an account</option>` + transferable.map((a) => `<option value="${a.id}">${esc(acctLabel(a))}</option>`).join("");
+  $("transferFrom").innerHTML = transferOpts;
+  $("transferTo").innerHTML = transferOpts;
+  // Same asset-backed-only reasoning as Transfer above - an income
+  // deposit needs a real linked_asset_id to actually apply via
+  // applyAssetDelta, which a credit-type account never has.
+  $("incAccount").innerHTML = `<option value="">None</option>` + transferable.map((a) => `<option value="${a.id}">${esc(acctLabel(a))}</option>`).join("");
   // A previously-typed bank_name (including one added via the "not
   // recognized, add anyway" override in saveAcctBtn) becomes just as
   // suggestable as a seeded FDIC name next time - rankBankMatches reads
@@ -1288,6 +1730,21 @@ async function syncParentAssetValue(parentAssetId) {
   await sb.from("assets").update({ value: Math.round(total * 100) / 100 }).eq("id", parentAssetId);
 }
 
+// Runs syncParentAssetValue for every parent with holdings, not just the
+// one being actively edited - this is what makes Net Worth/the Assets
+// card/the net-worth trend chart pick up a background price-agent.js
+// refresh on the next app open, instead of only ever seeing a live price
+// at the moment someone happens to open a holding's edit form. Each
+// parent's sync targets a distinct row with no interdependency, so these
+// run in parallel; one trailing loadAssets() (mirroring saveHoldingBtn's
+// own pattern) pulls the resynced values into memory and re-renders.
+async function syncAllParentAssetValues() {
+  const parentIds = new Set(assets.filter((a) => a.parent_asset_id).map((a) => a.parent_asset_id));
+  if (!parentIds.size) return;
+  await Promise.all([...parentIds].map((id) => syncParentAssetValue(id)));
+  await loadAssets();
+}
+
 async function loadAssets() {
   const { data } = await sb.from("assets").select("*").order("created_at");
   assets = data || [];
@@ -1364,6 +1821,7 @@ function renderAssetPriceFindings() {
   if (!card) return;
   if (!PRICE_FINDINGS_ENABLED) { card.classList.add("hidden"); return; }
   card.classList.remove("hidden");
+  renderPricesAsOf("assetPriceFindingsFreshness", latestFinnhubRefresh(assetPriceFindings));
 
   const bySymbol = new Map();
   for (const a of assets) {
@@ -1399,13 +1857,20 @@ function renderAssetPriceFindings() {
       const finding = matches[Number(el.dataset.applyPriceIdx)];
       const targets = bySymbol.get((finding.symbol || "").trim().toUpperCase()) || [];
       let applied = 0;
+      const parentsToSync = new Set();
       for (const asset of targets) {
         if (!asset.quantity) { toast(`Set a quantity for ${asset.name} first`); continue; }
         const newValue = Math.round(Number(finding.price) * Number(asset.quantity) * 100) / 100;
         const { error } = await sb.from("assets").update({ value: newValue }).eq("id", asset.id);
         if (error) { toast(error.message); continue; }
         applied++;
+        // A holding's own .value is never read by anything on its own -
+        // only the parent account's rolled-up value matters for net worth
+        // - without this, "Apply" on a holding looked
+        // successful but changed nothing anywhere.
+        if (asset.parent_asset_id) parentsToSync.add(asset.parent_asset_id);
       }
+      for (const parentId of parentsToSync) await syncParentAssetValue(parentId);
       if (applied) { await loadAssets(); toast(`Applied live price to ${applied} asset${applied === 1 ? "" : "s"}`); }
     };
   });
@@ -1504,6 +1969,8 @@ const ACTIVITY_LABEL = {
   owed_adjust: "Owed correction",
   account_created: "Account opened",
   contribution: "Contribution",
+  transfer: "Transfer",
+  income: "Income received",
 };
 // The one activity kind that moves no money and so has nothing to reverse -
 // "undoing" it would mean deleting the account, which is what the Accounts
@@ -1585,7 +2052,7 @@ function openAssetAdjust(accountId) {
     adjustingAccountId = null;
     return;
   }
-  closeAcctForm(); // never leave the add-account panel stacked behind this
+  closeAcctForm(); closeTransferForm(); // never leave the add-account/transfer panels stacked behind this
   adjustingAssetId = asset.id;
   adjustingAccountId = accountId;
   $("adjustAssetLabel").textContent = asset.name;
@@ -1643,7 +2110,7 @@ $("adjustSetBtn").onclick = async () => {
 // A date the user sees and acts on manually, not something that auto-
 // converts or auto-reminds beyond the notice in loadAssets() below -
 // consistent with this app's general preference for explicit user action
-// over automatic mutation of financial data.
+// over automatic mutation of financial data (see CD in ROADMAP.md).
 $("adjustMaturitySaveBtn").onclick = async () => {
   if (!adjustingAssetId) return;
   const maturity_date = $("adjustMaturityDate").value || null;
@@ -1891,7 +2358,31 @@ async function loadDebts() {
   });
   renderNetWorth();
   renderAccountsList(); // a changed liability balance may be a linked account's balance line
+  renderDebtStrategy();
 }
+
+// Purely informational - shows real avalanche/snowball numbers side by
+// side, never states which to pick (same boundary the Investments tab's
+// allocation calculator already holds for what to buy). Re-runs live as
+// the "extra monthly" input changes and whenever loadDebts() re-runs, so
+// it always reflects the current liabilities and their real balances.
+function renderDebtStrategy() {
+  const extra = parseFloat($("debtStrategyExtra").value) || 0;
+  const { avalanche, snowball, excludedCount } = compareDebtStrategies(debts, extra);
+  const el = $("debtStrategyResult");
+  if (!avalanche) {
+    el.innerHTML = `<p class="muted">Add an interest rate and minimum payment to at least one liability to see this comparison.</p>`;
+  } else {
+    const line = (label, r) => r.neverPaysOff
+      ? `<div><strong>${esc(label)}:</strong> minimum payment won't cover interest - balance will grow</div>`
+      : `<div><strong>${esc(label)}:</strong> ${r.months}mo to debt-free, ${fmt(r.totalInterest)} total interest</div>`;
+    el.innerHTML = line("Avalanche (highest interest first)", avalanche) + line("Snowball (smallest balance first)", snowball);
+  }
+  $("debtStrategyExcluded").textContent = excludedCount
+    ? `${excludedCount} liabilit${excludedCount === 1 ? "y" : "ies"} not included (missing interest rate/minimum payment, already paid off, or an active HELOC draw period).`
+    : "";
+}
+$("debtStrategyExtra").addEventListener("input", renderDebtStrategy);
 
 // Interest rate / minimum payment / due date / draw period end - never
 // balance, which stays strictly driven by real expenses/payments against
@@ -1902,7 +2393,7 @@ async function loadDebts() {
 let editingDebtDetails = null;
 function openDebtDetailsForm(debt) {
   if (!debt) return;
-  closeAcctForm(); // never leave the add-account panel stacked behind this
+  closeAcctForm(); closeTransferForm(); // never leave the add-account/transfer panels stacked behind this
   editingDebtDetails = debt;
   $("debtDetailsRate").value = debt.interest_rate ?? "";
   $("debtDetailsMinPay").value = debt.minimum_payment ?? "";
@@ -2027,7 +2518,7 @@ function openDebtBalanceForm(debtId, tab) {
   }
   const debt = debts.find((d) => d.id === debtId);
   if (!debt) return;
-  closeAcctForm(); // never leave the add-account panel stacked behind this
+  closeAcctForm(); closeTransferForm(); // never leave the add-account/transfer panels stacked behind this
   activeDebtId = debtId;
   $("debtBalanceLabel").textContent = debt.name;
   $("debtBalanceCurrent").textContent = fmt(debt.balance);
@@ -2719,6 +3210,33 @@ async function undoActivity(row) {
     const { error } = await sb.from("assets").update({ value: newValue }).eq("id", asset.id);
     if (error) return toast(error.message);
     await syncParentAssetValue(asset.parent_asset_id); // no-op unless asset is itself a holding
+  } else if (row.kind === "transfer") {
+    // Reverses both legs - money goes back from the receiving asset
+    // (related_account_id) to the funding asset (account_id), the exact
+    // mirror of the original transfer.
+    const fromAccount = accounts.find((a) => a.id === row.account_id);
+    const toAccount = accounts.find((a) => a.id === row.related_account_id);
+    const fromAsset = fromAccount ? assets.find((a) => a.id === fromAccount.linked_asset_id) : null;
+    const toAsset = toAccount ? assets.find((a) => a.id === toAccount.linked_asset_id) : null;
+    if (!fromAsset || !toAsset) return toast("Can't undo - one of the accounts no longer exists.");
+    const newToValue = Math.round((Number(toAsset.value) - Number(row.amount)) * 100) / 100;
+    if (newToValue < 0) return toast(`Can't undo - would take ${toAsset.name} below $0.`);
+    const { error: toErr } = await sb.from("assets").update({ value: newToValue }).eq("id", toAsset.id);
+    if (toErr) return toast(toErr.message);
+    const newFromValue = Math.round((Number(fromAsset.value) + Number(row.amount)) * 100) / 100;
+    const { error: fromErr } = await sb.from("assets").update({ value: newFromValue }).eq("id", fromAsset.id);
+    if (fromErr) return toast(fromErr.message);
+  } else if (row.kind === "income") {
+    // Always a positive deposit, so undoing is always a straight
+    // subtraction - never a sign-dependent reversal the way asset_adjust's
+    // undo is.
+    const account = accounts.find((a) => a.id === row.account_id);
+    const asset = account ? assets.find((a) => a.id === account.linked_asset_id) : null;
+    if (!asset) return toast("Can't undo - the linked account no longer exists.");
+    const newValue = Math.round((Number(asset.value) - Number(row.amount)) * 100) / 100;
+    if (newValue < 0) return toast(`Can't undo - would take ${asset.name} below $0.`);
+    const { error } = await sb.from("assets").update({ value: newValue }).eq("id", asset.id);
+    if (error) return toast(error.message);
   }
   const { error } = await sb.from("account_activity").delete().eq("id", row.id);
   if (error) return toast(error.message);
@@ -2924,6 +3442,8 @@ async function loadReports() {
   loadInsights();
   populateHistoryAccountSelect();
   renderAccountHistory();
+  populateForecastAccountSelect();
+  renderCashFlowForecast();
   await renderNetWorthTrend();
 }
 
@@ -3149,17 +3669,29 @@ function renderInvestments() {
           </div>
         </div>
         ${h.explanation ? `<div class="muted" style="font-size:12px">${esc(h.explanation)}</div>` : ""}
+        ${h.headlines && h.headlines.length ? `<div class="muted" style="font-size:12px"><a href="${esc(h.headlines[0].url)}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(h.headlines[0].title)}</a>${h.headlines[0].source ? " · " + esc(h.headlines[0].source) : ""}</div>` : ""}
       </div>`;
   };
   $("investHoldingsList").innerHTML = parents.length ? parents.map((p) => {
     const children = investmentAssets.filter((a) => a.parent_asset_id === p.id);
+    // Log contribution only makes sense for a parent with no holdings under
+    // it - it bumps the parent's own .value directly, but a with-holdings
+    // parent's value is ONLY ever the sum of its holdings ("no
+    // separate uninvested-cash concept"). syncParentAssetValue() would
+    // silently overwrite a logged contribution back to sum(holdings) the
+    // next time it runs for that parent - real "new money in" for a
+    // with-holdings account already has its own path, the Holdings form's
+    // funding-account field.
+    const contributionAffordance = children.length
+      ? ""
+      : `<div class="muted" data-log-contribution="${p.id}" style="font-size:11px;cursor:pointer;text-decoration:underline;margin-top:2px">Log contribution</div>`;
     return `
       <div style="margin-bottom:14px">
         <div class="exp" style="cursor:default">
           <div>
             <div><strong>${esc(p.name)}</strong></div>
             <div class="meta">${assetTypeLabel(p.type)}${children.length ? ` · ${children.length} holding${children.length === 1 ? "" : "s"}` : ""}</div>
-            <div class="muted" data-log-contribution="${p.id}" style="font-size:11px;cursor:pointer;text-decoration:underline;margin-top:2px">Log contribution</div>
+            ${contributionAffordance}
           </div>
           <span class="amt">${fmt(effectiveAssetValue(p))}</span>
         </div>
@@ -3194,8 +3726,8 @@ function renderInvestments() {
   });
 
   // Base 2025 IRS limits, factual math only - see CONTRIBUTION_LIMIT_GROUPS'
-  // own comment. Colored red once over the limit, same as renderBudgets'
-  // over-budget styling - this
+  // own comment above. Colored red
+  // once over the limit, same as renderBudgets' over-budget styling - this
   // is a real hard legal limit, not the soft "aim for under 30%" utilization
   // guideline the Liabilities card's credit-utilization line deliberately
   // leaves uncolored, so a color here is stating a fact, not nudging advice.
@@ -3302,38 +3834,169 @@ function renderInvestmentHealth(totals, allocation, limitUsage, holdings) {
 // real facts about the user's own entered data to show), there's no
 // manual-entry fallback for a market index - an empty "not available yet"
 // card forever would be pure clutter, not a fact worth stating.
+//
+// Reuses HEALTH_TONE_COLOR's ok/warn/neutral vocabulary for the daily
+// news digest's sentiment dot below, rather than inventing a new color
+// map - bullish maps to the same green "ok" already means elsewhere,
+// bearish to the same red "warn."
+const SENTIMENT_TONE = { bullish: "ok", neutral: "neutral", bearish: "warn" };
+const SENTIMENT_LABEL = { bullish: "Bullish", neutral: "Neutral", bearish: "Bearish" };
+
+// A trade_date is a plain "YYYY-MM-DD" with no timezone in it, so build
+// the Date from its parts - `new Date("2026-08-20")` parses as UTC and
+// renders as the previous day for anyone west of Greenwich.
+const recapDateLabel = (iso) => {
+  const [y, m, d] = (iso || "").split("-").map(Number);
+  if (!y || !m || !d) return "";
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+};
+
+// Stage 1 recap: real numbers and real linked headlines, no generated text
+// anywhere on this card. Deliberately no bullish/bearish label and no
+// causal claim - a headline is shown as that day's COVERAGE of the symbol,
+// which is what it actually is. Asserting it as the reason the price moved
+// would be stating a causation this app can't establish, the same line
+// marketBreadth()'s plain count and the credit-utilization line already
+// hold.
+function renderDailyRecap() {
+  const card = $("dailyRecapCard");
+  if (!card) return;
+  const recap = latestRecap(dailyRecaps);
+  // No manual-entry fallback exists for a market recap, so an empty card
+  // would be clutter rather than a fact worth stating - hidden entirely
+  // until a real one exists, same convention as Market overview.
+  if (!recap) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  renderAgentFreshness("daily-recap", "dailyRecapFreshness", "dailyRecapWarning");
+
+  $("dailyRecapDate").textContent = `Market close, ${recapDateLabel(recap.tradeDate)}`;
+
+  const breadth = recap.breadth;
+  const breadthEl = $("dailyRecapBreadth");
+  if (breadth) {
+    breadthEl.textContent = `${breadth.up} of ${breadth.total} tracked large-caps finished up`;
+    breadthEl.style.color = breadth.up > breadth.down ? "var(--ok)"
+      : breadth.down > breadth.up ? "var(--err)" : "var(--text)";
+  } else {
+    breadthEl.textContent = "";
+  }
+
+  // Stage 2 (a single batched Gemini synthesis) is the only thing that
+  // ever fills this - stays hidden on a rollup-only recap rather than
+  // showing a placeholder for something that may never be generated.
+  // Explicitly labelled as written rather than measured: every other line
+  // on this card is a real number or a real link, and the reader should
+  // never have to guess which is which. Same distinction marketBreadth()
+  // draws when it calls itself "a plain count, not an AI's read."
+  // esc() because this is model output, the exact provenance that rule
+  // exists for.
+  const summaryEl = $("dailyRecapSummary");
+  summaryEl.innerHTML = recap.summary
+    ? `<span class="muted" style="font-size:11px">AI-written summary of the numbers and coverage above</span><br>${esc(recap.summary)}`
+    : "";
+  summaryEl.classList.toggle("hidden", !recap.summary);
+
+  $("dailyRecapMovers").innerHTML = recap.movers.map((m) => `
+    <div class="exp" style="cursor:default">
+      <div>
+        <div>${esc(m.symbol)}</div>
+        ${m.headline
+          ? `<div class="meta"><a href="${esc(m.headline.url)}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(m.headline.title)}</a>${m.headline.source ? " · " + esc(m.headline.source) : ""}</div>`
+          : `<div class="meta muted">No headline found for this move</div>`}
+      </div>
+      <span class="amt" style="text-align:right">
+        ${fmt(m.close)}
+        <div style="font-size:12px;color:${gainColor(m.change_pct)}">${signedPct(m.change_pct)}</div>
+      </span>
+    </div>`).join("");
+
+  $("dailyRecapIndexes").textContent = recap.indexMoves.length
+    ? "Index proxies: " + recap.indexMoves.map((i) => `${i.symbol} ${signedPct(i.change_pct)}`).join("  ·  ")
+    : "";
+}
+
 function renderMarketOverview() {
   const card = $("marketOverviewCard");
   if (!card) return;
   if (!PRICE_FINDINGS_ENABLED) { card.classList.add("hidden"); return; }
   card.classList.remove("hidden");
+  renderAgentFreshness("price-agent", "marketOverviewFreshness", "marketOverviewWarning");
   const indexes = marketIndexSummary(MARKET_INDEXES, marketIndexFindings);
-  $("marketOverviewList").innerHTML = indexes.map((idx) => `
-    <div class="exp" style="cursor:default">
-      <div>
-        <div>${esc(idx.label)}</div>
-        ${idx.explanation ? `<div class="meta">${esc(idx.explanation)}</div>` : ""}
+  // Live ETF-proxy prices - marketIndexSummary() works unchanged against
+  // any label list, so this reuses it directly with the ETF tickers
+  // instead of the index names (see MARKET_INDEX_ETF_PROXIES's own
+  // comment for why the two are stored as separate symbols, never mixed).
+  const etfTickers = Object.values(MARKET_INDEX_ETF_PROXIES);
+  const etfByTicker = new Map(marketIndexSummary(etfTickers, marketIndexFindings).map((e) => [e.label, e]));
+  renderPricesAsOf("marketOverviewLiveFreshness", latestFinnhubRefresh(marketIndexFindings));
+
+  // A real, computed fact from the same already-loaded live data below -
+  // never an AI-inferred read, so it's available exactly as often as
+  // real prices are, with zero rate-limit exposure. Plain "X of Y up"
+  // wording, not a bullish/bearish label - a count isn't an opinion.
+  const pulse = marketBreadth(MARKET_MOVERS_WATCHLIST, etfTickers, marketIndexFindings);
+  const pulseEl = $("marketPulse");
+  if (pulseEl) {
+    if (!pulse) {
+      pulseEl.textContent = "";
+    } else {
+      const tone = pulse.up > pulse.down ? "var(--ok)" : pulse.down > pulse.up ? "var(--err)" : "var(--text)";
+      pulseEl.style.color = tone;
+      const avgText = pulse.avgEtfChangePct != null ? `, tracked indexes avg ${signedPct(pulse.avgEtfChangePct)}` : "";
+      pulseEl.textContent = `${pulse.up} of ${pulse.total} tracked large-caps up today${avgText}`;
+    }
+  }
+  $("marketOverviewList").innerHTML = indexes.map((idx) => {
+    const etfTicker = MARKET_INDEX_ETF_PROXIES[idx.label];
+    const live = etfTicker ? etfByTicker.get(etfTicker) : null;
+    return `
+    <div class="exp" style="cursor:default;flex-direction:column;align-items:stretch;gap:2px">
+      <div style="display:flex;justify-content:space-between;gap:10px">
+        <div>
+          <div>${esc(idx.label)}</div>
+          ${idx.explanation ? `<div class="meta">${esc(idx.explanation)}</div>` : ""}
+        </div>
+        <span class="amt" style="text-align:right">
+          ${idx.price != null ? fmtNum(idx.price) : `<span class="muted" style="font-size:12px">index level not available yet</span>`}
+          ${idx.change != null ? `<div style="font-size:12px;color:${gainColor(idx.change)}">${signedPct(idx.changePct)}</div>` : ""}
+        </span>
       </div>
-      <span class="amt" style="text-align:right">
-        ${idx.price != null ? fmtNum(idx.price) : `<span class="muted" style="font-size:12px">not available yet</span>`}
-        ${idx.change != null ? `<div style="font-size:12px;color:${gainColor(idx.change)}">${signedPct(idx.changePct)}</div>` : ""}
-      </span>
-    </div>`).join("");
+      ${live && live.price != null ? `<div class="meta" style="font-size:12px">Live via ${esc(etfTicker)}: ${fmt(live.price)}${live.changePct != null ? ` <span style="color:${gainColor(live.change)}">${signedPct(live.changePct)}</span>` : ""}</div>` : ""}
+    </div>`;
+  }).join("");
 
   const movers = topMarketMovers(MARKET_MOVERS_WATCHLIST, marketIndexFindings, 3);
   const moversSection = $("marketMoversSection");
   if (moversSection) moversSection.classList.toggle("hidden", !movers.length);
+  renderPricesAsOf("marketMoversFreshness", latestFinnhubRefresh(marketIndexFindings));
   $("marketMoversList").innerHTML = movers.map((m) => `
     <div class="exp" style="cursor:default">
       <div>
         <div>${esc(m.label)}</div>
         ${m.explanation ? `<div class="meta">${esc(m.explanation)}</div>` : ""}
+        ${m.headlines && m.headlines.length ? `<div class="meta"><a href="${esc(m.headlines[0].url)}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(m.headlines[0].title)}</a>${m.headlines[0].source ? " · " + esc(m.headlines[0].source) : ""}</div>` : ""}
       </div>
       <span class="amt" style="text-align:right">
         ${fmtNum(m.price)}
         <div style="font-size:12px;color:${gainColor(m.change)}">${signedPct(m.changePct)}</div>
       </span>
     </div>`).join("");
+
+  const digest = latestNewsDigest(marketNewsFindings);
+  const newsSection = $("marketNewsSection");
+  if (newsSection) newsSection.classList.toggle("hidden", !digest);
+  if (digest) {
+    $("marketSentimentDot").style.background = HEALTH_TONE_COLOR[SENTIMENT_TONE[digest.sentiment]];
+    $("marketSentimentLabel").textContent = SENTIMENT_LABEL[digest.sentiment];
+    $("marketSentimentReason").textContent = digest.sentimentReason || "";
+    $("marketNewsList").innerHTML = digest.headlines.map((h) => `
+      <div class="exp" style="cursor:default">
+        <a href="${esc(h.url)}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit">
+          <div>${esc(h.title)}</div>
+          ${h.source ? `<div class="meta">${esc(h.source)}</div>` : ""}
+        </a>
+      </div>`).join("");
+  }
 }
 
 // ---- HOLDINGS (specific tickers inside an investment account) -----------
@@ -3354,13 +4017,15 @@ let editingHolding = null;
 // a VARIABLE annuity genuinely does (its value tracks named sub-account
 // funds, much like a 401(k)'s fund menu) - there's no separate fixed/
 // variable type to gate on, so this stays permissive rather than blocking
-// a real use case to guard against a different one.
+// a real use case to guard against a different one (see docs/bank-account-
+// types-research.md §5.8/§9b for the fixed-vs-variable distinction).
 const TICKER_ELIGIBLE_ASSET_TYPES = new Set(
   [...INVESTMENT_ASSET_TYPES].filter((t) => t !== "pension")
 );
 
 // Base 2025 IRS contribution limits, no catch-up/income-phase-out/filing-
-// status adjustments. Every excluded
+// status adjustments - see the code comments above for
+// the full reasoning per type and per group, including every excluded
 // type's specific reason for not being tracked (sep_ira needs income data
 // this app doesn't have, 529/UTMA use a gift-tax exclusion rather than a
 // clean single limit, a rollover/inherited IRA generally can't receive new
@@ -3406,10 +4071,12 @@ function holdingParentAssets() {
 }
 
 // Required fields on the holding form: an explicit account, a ticker, share
-// count, and cost basis - the same "starts blank, red border while empty"
-// treatment as REQUIRED_QUICK_ADD_FIELDS, reused rather than reinvented.
-// holdingValue is deliberately absent - it stays genuinely optional (falls
-// back to cost basis, see saveHoldingBtn).
+// count, and price per share - the same "starts blank, red border while
+// empty" treatment as REQUIRED_QUICK_ADD_FIELDS, reused rather than
+// reinvented. holdingCostBasis holds a
+// PER-SHARE price now (see saveHoldingBtn for the conversion to the
+// TOTAL actually stored in assets.purchase_price) - same id, changed
+// meaning, so this list and the highlighting wiring below needed no change.
 const REQUIRED_HOLDING_FIELDS = ["holdingAccount", "holdingSymbol", "holdingQuantity", "holdingCostBasis"];
 // Tracks the exact symbol text the user has already confirmed via the
 // "not recognized, add anyway" override, so re-showing that confirm on
@@ -3454,6 +4121,172 @@ for (const id of REQUIRED_HOLDING_FIELDS) {
 // re-checked, not silently inherit the earlier confirmation.
 $("holdingSymbol").addEventListener("input", () => { holdingSymbolOverrideConfirmedFor = null; });
 
+// Checks both already-loaded findings arrays - a user's own tracked
+// symbols (assetPriceFindings) AND the fixed movers watchlist
+// (marketIndexFindings), since a brand-new ticker being entered for the
+// first time won't be in the former yet but might already be priced via
+// the latter. No new network call - both are already in module state.
+function findLivePrice(symbol) {
+  const upper = symbol.trim().toUpperCase();
+  const rows = [...assetPriceFindings, ...marketIndexFindings]
+    .filter((f) => (f.symbol || "").trim().toUpperCase() === upper);
+  if (!rows.length) return null;
+  const latest = rows.sort((a, b) => new Date(b.found_at) - new Date(a.found_at))[0];
+  return latest.price != null ? Number(latest.price) : null;
+}
+
+// Genuinely real-time, on-demand lookup for the Holdings form's "Buying now"
+// mode - unlike findLivePrice() above, which only checks the already-loaded,
+// weekly-refreshed price-agent.js findings. Proxied through this app's own
+// Worker route (worker.js's /api/price) so the Finnhub key never reaches the
+// browser and Finnhub's own lack of CORS support (confirmed live) is never
+// hit directly. Best-effort: returns null on any failure (not signed in,
+// network error, unknown symbol) so the caller can degrade gracefully
+// rather than throwing.
+async function fetchLivePriceOnDemand(symbol) {
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) return null;
+  try {
+    const res = await fetch(`/api/price?symbol=${encodeURIComponent(symbol)}`, {
+      headers: { Authorization: `Bearer ${session.access_token}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.price ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Live "estimated total" line, same shape a real trade ticket shows as you
+// type quantity/price - purely a display confirmation, not itself saved.
+function updateHoldingTotalCost() {
+  const quantity = parseFloat($("holdingQuantity").value);
+  const pricePerShare = parseFloat($("holdingCostBasis").value);
+  const el = $("holdingTotalCost");
+  if (Number.isFinite(quantity) && quantity > 0 && Number.isFinite(pricePerShare) && pricePerShare >= 0) {
+    el.textContent = `Total: ${fmt(quantity * pricePerShare)}`;
+  } else {
+    el.textContent = "";
+  }
+}
+$("holdingQuantity").addEventListener("input", updateHoldingTotalCost);
+$("holdingCostBasis").addEventListener("input", updateHoldingTotalCost);
+
+// "Already own this" (the default): only for a NEW holding (editing one
+// means the user already has a real price basis set - never silently
+// overwrite that just because they touched the ticker field) and only if
+// price-per-share is still empty (never clobber something the user already
+// typed). Fires on blur, not every keystroke, so it doesn't fight with
+// someone still mid-typing a ticker. "Buying now" routes to a genuinely
+// live, on-demand lookup instead - see refreshHoldingLivePrice below.
+$("holdingSymbol").addEventListener("blur", () => {
+  const symbol = $("holdingSymbol").value.trim();
+  if (!symbol) return;
+  if (holdingEntryMode === "buying") {
+    refreshHoldingLivePrice(symbol);
+    return;
+  }
+  if (editingHolding || $("holdingCostBasis").value !== "") return;
+  const price = findLivePrice(symbol);
+  if (price == null) return;
+  $("holdingCostBasis").value = price;
+  updateHoldingTotalCost();
+  updateHoldingFieldHighlighting();
+  toast(`Filled with today's live price (${fmt(price)}) - edit if you paid differently`);
+});
+
+// State for the "Buying now" mode's shares<->dollar-amount conversion -
+// holdingLivePrice is the last on-demand quote fetched for the current
+// ticker (null until one arrives, or if none was found). holdingLiveFetchToken
+// guards against a stale response landing after a newer request was already
+// sent (the user changed the ticker again while the first lookup was still
+// in flight) - only the response matching the current token is applied.
+let holdingEntryMode = "own";
+let holdingBuyBasis = "shares";
+let holdingLivePrice = null;
+let holdingLiveFetchToken = 0;
+
+async function refreshHoldingLivePrice(symbol) {
+  const token = ++holdingLiveFetchToken;
+  holdingLivePrice = null;
+  $("holdingCostBasis").value = "";
+  $("holdingLivePriceStatus").textContent = "Checking live price...";
+  const price = await fetchLivePriceOnDemand(symbol);
+  if (token !== holdingLiveFetchToken) return;
+  if (price == null) {
+    // No live price - degrade to the same manual price-per-share entry
+    // "Already own this" mode already uses, rather than dead-ending the form.
+    $("holdingLivePriceStatus").textContent = "No live price available for this ticker right now - enter the price you're paying manually.";
+    $("holdingCostBasis").readOnly = false;
+    setHoldingBuyBasis("shares");
+  } else {
+    holdingLivePrice = price;
+    $("holdingLivePriceStatus").textContent = `Live price: ${fmt(price)} per share`;
+    $("holdingCostBasis").value = price;
+    $("holdingCostBasis").readOnly = true;
+  }
+  recomputeHoldingBuyFields();
+}
+
+// Only the "By dollar amount" sub-mode derives a field (shares, from the
+// typed dollar amount / the live price) - "By shares" is directly typed and
+// already flows through the existing updateHoldingTotalCost() unchanged.
+function recomputeHoldingBuyFields() {
+  if (holdingEntryMode === "buying" && holdingBuyBasis === "dollars" && holdingLivePrice != null) {
+    const dollars = parseFloat($("holdingDollarAmount").value);
+    $("holdingQuantity").value = Number.isFinite(dollars) && dollars > 0
+      ? Math.round((dollars / holdingLivePrice) * 1e6) / 1e6
+      : "";
+  }
+  updateHoldingTotalCost();
+  updateHoldingFieldHighlighting();
+}
+
+function setHoldingBuyBasis(basis) {
+  holdingBuyBasis = basis;
+  document.querySelectorAll("#holdingBuyModePills [data-holding-buy-basis]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.holdingBuyBasis === basis);
+  });
+  const dollarMode = basis === "dollars";
+  $("holdingDollarAmountRow").classList.toggle("hidden", !dollarMode);
+  $("holdingQuantity").readOnly = holdingEntryMode === "buying" && dollarMode;
+  if (!dollarMode) $("holdingDollarAmount").value = "";
+  recomputeHoldingBuyFields();
+}
+
+function setHoldingEntryMode(mode) {
+  holdingEntryMode = mode;
+  holdingLivePrice = null;
+  document.querySelectorAll("#holdingModePills [data-holding-mode]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.holdingMode === mode);
+  });
+  $("holdingBuyModePills").classList.toggle("hidden", mode !== "buying");
+  $("holdingDollarAmountRow").classList.add("hidden");
+  $("holdingDollarAmount").value = "";
+  $("holdingLivePriceStatus").textContent = "";
+  $("holdingCostBasisLabel").textContent = mode === "buying" ? "Price per share (live)" : "Price per share";
+  $("holdingQuantity").readOnly = false;
+  $("holdingCostBasis").readOnly = false;
+  if (mode === "buying") {
+    holdingBuyBasis = "shares";
+    document.querySelectorAll("#holdingBuyModePills [data-holding-buy-basis]").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.holdingBuyBasis === "shares");
+    });
+    const symbol = $("holdingSymbol").value.trim();
+    if (symbol) refreshHoldingLivePrice(symbol);
+  }
+  updateHoldingFieldHighlighting();
+  updateHoldingTotalCost();
+}
+document.querySelectorAll("#holdingModePills [data-holding-mode]").forEach((btn) => {
+  btn.addEventListener("click", () => setHoldingEntryMode(btn.dataset.holdingMode));
+});
+document.querySelectorAll("#holdingBuyModePills [data-holding-buy-basis]").forEach((btn) => {
+  btn.addEventListener("click", () => setHoldingBuyBasis(btn.dataset.holdingBuyBasis));
+});
+$("holdingDollarAmount").addEventListener("input", recomputeHoldingBuyFields);
+
 function openHoldingForm(holding) {
   editingHolding = holding || null;
   holdingSymbolOverrideConfirmedFor = null;
@@ -3476,10 +4309,24 @@ function openHoldingForm(holding) {
   $("holdingAccount").value = holding?.parent_asset_id ?? "";
   $("holdingSymbol").value = holding?.price_symbol ?? "";
   $("holdingQuantity").value = holding?.quantity ?? "";
-  $("holdingCostBasis").value = holding?.purchase_price ?? "";
-  $("holdingValue").value = holding?.value ?? "";
+  // assets.purchase_price stores the TOTAL paid, but this field shows a
+  // PER-SHARE price (matches a real trade ticket) - convert back for
+  // display. Guarded against a zero/missing quantity even though it's
+  // already required and should never be 0 on a saved holding.
+  $("holdingCostBasis").value = holding && holding.quantity
+    ? Math.round((holding.purchase_price / holding.quantity) * 100) / 100
+    : "";
+  // Always blank, add or edit - this represents a one-shot action taken
+  // at save time, not a stored fact about the holding, so there's nothing
+  // on the holding row to pre-fill it from.
+  $("holdingFundingAccount").value = "";
   $("holdingBucket").value = holding?.investment_bucket ?? "";
+  // Always resets to "Already own this" on open (add or edit) - the more
+  // common case (entering an existing portfolio) and today's already-shipped
+  // default behavior, unaffected by whatever mode was active last time.
+  setHoldingEntryMode("own");
   updateHoldingFieldHighlighting();
+  updateHoldingTotalCost();
   $("holdingForm").classList.remove("hidden");
   $("holdingForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -3504,16 +4351,38 @@ $("saveHoldingBtn").onclick = async () => {
   if (!parentId) { flagField("holdingAccount"); return toast("Choose the account this sits in"); }
   const symbol = $("holdingSymbol").value.trim().toUpperCase();
   if (!symbol) { flagField("holdingSymbol"); return toast("Enter a ticker or symbol"); }
-  // Shares and cost basis are required, not optional - a holding without
-  // them was previously just a name with no actual position behind it.
+  // Shares and price per share are required, not optional - a holding
+  // without them was previously just a name with no actual position
+  // behind it.
   if ($("holdingQuantity").value === "") { flagField("holdingQuantity"); return toast("Enter the number of shares"); }
   const quantity = parseFloat($("holdingQuantity").value);
   if (!Number.isFinite(quantity) || quantity <= 0) { flagField("holdingQuantity"); return toast("Shares must be a positive number"); }
-  if ($("holdingCostBasis").value === "") { flagField("holdingCostBasis"); return toast("Enter what you paid in total"); }
-  const costBasis = parseFloat($("holdingCostBasis").value);
-  if (!Number.isFinite(costBasis) || costBasis < 0) { flagField("holdingCostBasis"); return toast("Cost basis can't be negative"); }
-  const value = $("holdingValue").value !== "" ? parseFloat($("holdingValue").value) : null;
-  if (value !== null && (!Number.isFinite(value) || value < 0)) { flagField("holdingValue"); return toast("Current value can't be negative"); }
+  if ($("holdingCostBasis").value === "") { flagField("holdingCostBasis"); return toast("Enter what you paid per share"); }
+  const pricePerShare = parseFloat($("holdingCostBasis").value);
+  if (!Number.isFinite(pricePerShare) || pricePerShare < 0) { flagField("holdingCostBasis"); return toast("Price per share can't be negative"); }
+
+  // The form takes a PER-SHARE price (matches a real trade ticket), but
+  // assets.purchase_price stores the TOTAL - every reader of that column
+  // (investments.js's investmentHoldings(), gain/loss math) already
+  // expects a total, so convert here rather than changing that contract.
+  const totalCostBasis = Math.round(pricePerShare * quantity * 100) / 100;
+  // Only a POSITIVE delta is money actually being spent right now - a new
+  // holding starts from 0, editing one compares against its existing
+  // total. Editing quantity/price DOWN (a correction, not a sale - this
+  // app has no "sell" workflow) yields a delta <= 0, which deliberately
+  // skips funding entirely below - there's no reliable way to tell a
+  // correction apart from a real partial sale, so guessing would be worse
+  // than doing nothing.
+  const previousCostBasis = editingHolding ? Number(editingHolding.purchase_price) : 0;
+  const costBasisDelta = Math.round((totalCostBasis - previousCostBasis) * 100) / 100;
+  const fundingAccountId = $("holdingFundingAccount").value || null;
+  // Checked up front, before the async ticker-confirm dialog below - fail
+  // fast on insufficient funds rather than making someone confirm an
+  // unusual ticker only to then find out they can't afford it.
+  if (fundingAccountId && costBasisDelta > 0) {
+    const fundingErr = assetDeltaError([{ accountId: fundingAccountId, amount: costBasisDelta, sign: -1 }]);
+    if (fundingErr) { flagField("holdingFundingAccount"); return toast(fundingErr); }
+  }
 
   const parent = assets.find((a) => a.id === parentId);
   // isKnownTicker() checks a hand-curated, necessarily incomplete list
@@ -3539,12 +4408,13 @@ $("saveHoldingBtn").onclick = async () => {
     parent_asset_id: parentId,
     price_symbol: symbol,
     quantity,
-    purchase_price: costBasis,
-    // A blank Current Value no longer means "worth $0" (that's a real,
-    // false claim about a position that was just paid costBasis for) - it
-    // means "not priced yet," which is honestly closer to costBasis than
-    // to zero until a live price arrives (syncParentAssetValue/price-agent).
-    value: value ?? costBasis,
+    purchase_price: totalCostBasis,
+    // No separate "current value" input anymore (removed - a real
+    // purchase doesn't have one either, and it only ever mattered as a
+    // fallback until a live price arrived). Starting value is just what
+    // was paid - not a false "worth $0" claim, and syncParentAssetValue/
+    // price-agent takes over the moment a live price actually exists.
+    value: totalCostBasis,
     investment_bucket: $("holdingBucket").value.trim() || null,
   };
   // Captured before closeHoldingForm() clears editingHolding below.
@@ -3556,6 +4426,18 @@ $("saveHoldingBtn").onclick = async () => {
     ? await sb.from("assets").update(row).eq("id", editingHolding.id)
     : await sb.from("assets").insert(row);
   if (error) { flagField("holdingSymbol"); return toast(error.message); }
+  // Mirrors exactly where Quick Add calls applyAssetDelta after its own
+  // expenses.insert - re-checked against fundingAccountId/costBasisDelta
+  // (not just "was a funding account selected") since a decrease must
+  // never reach here even if a funding account happens to still be set.
+  if (fundingAccountId && costBasisDelta > 0) {
+    await applyAssetDelta(fundingAccountId, null, costBasisDelta, -1);
+    await logActivity(
+      "asset_adjust",
+      `Bought ${quantity} ${symbol} - funded from ${acctName(fundingAccountId)}`,
+      -costBasisDelta, undefined, fundingAccountId
+    );
+  }
   closeHoldingForm();
   await loadAssets();
   await syncParentAssetValue(parentId);
@@ -3657,8 +4539,8 @@ $("investRiskLabel").onchange = async () => {
 };
 
 // Whichever side of accounts.linked_asset_id/linked_liability_id is set is
-// where the live balance actually lives - an account row itself never
-// stores a dollar value.
+// where the live balance actually lives - an
+// account row itself never stores a dollar value.
 function accountCurrentBalance(account) {
   if (account.linked_asset_id) return Number(assets.find((a) => a.id === account.linked_asset_id)?.value ?? 0);
   if (account.linked_liability_id) return Number(debts.find((d) => d.id === account.linked_liability_id)?.balance ?? 0);
@@ -3687,6 +4569,28 @@ function renderAccountHistory() {
     return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   });
   renderLineChart($("historyChart"), labels, points.map((p) => p.balance));
+}
+
+// Same account-picker shape as populateHistoryAccountSelect above, kept
+// as its own separate select (not shared) since a user may reasonably
+// want to look at a different account's history vs. its forecast at once.
+function populateForecastAccountSelect() {
+  const sel = $("forecastAccountSelect");
+  const prev = sel.value;
+  sel.innerHTML = accounts.map((a) => `<option value="${a.id}">${esc(acctLabel(a))}</option>`).join("");
+  sel.value = accounts.some((a) => a.id === prev) ? prev : (accounts[0]?.id ?? "");
+}
+$("forecastAccountSelect").onchange = renderCashFlowForecast;
+
+function renderCashFlowForecast() {
+  const account = accounts.find((a) => a.id === $("forecastAccountSelect").value);
+  if (!account) return;
+  const points = forecastCashFlow(account, accountCurrentBalance(account), subscriptions, incomeSources, 30);
+  const labels = points.map((p) => {
+    const [y, m, d] = p.date.split("-").map(Number);
+    return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  });
+  renderLineChart($("forecastChart"), labels, points.map((p) => p.balance));
 }
 
 // Latest monthly report, generated server-side by tools/monthly-report.js.
@@ -3783,6 +4687,23 @@ async function renderReports() {
   $("rptTotal").textContent = fmt(total);
   $("rptSubs").textContent = fmt(subs);
 
+  // Always "right now," not scoped to the selected month above - liquid
+  // assets are a live current balance, not a historical figure, so
+  // anchoring to today (not ym) keeps this from changing confusingly as
+  // the user browses past months in the dropdown. Same reasoning the
+  // account-history/net-worth-trend cards already use for staying
+  // unscoped to monthSel.
+  const efMonths = lastMonths(3, monthKey());
+  const efAvgSpending = monthlyTotals(allExpenses, efMonths).reduce((s, v) => s + v, 0) / efMonths.length;
+  const efLiquidAssets = accounts
+    .filter((a) => !NON_SPENDABLE_ACCOUNT_TYPES.has(a.type) && !a.archived_at && a.linked_asset_id)
+    .reduce((sum, a) => {
+      const asset = assets.find((x) => x.id === a.linked_asset_id);
+      return sum + (asset ? Number(asset.value) : 0);
+    }, 0);
+  const efCoverage = emergencyFundCoverage(efLiquidAssets, efAvgSpending);
+  $("rptEmergencyFund").textContent = efCoverage != null ? `${efCoverage}mo` : "—";
+
   const empty = total === 0;
   $("rptEmpty").classList.toggle("hidden", !empty);
 
@@ -3794,6 +4715,16 @@ async function renderReports() {
   renderBreakdownBar($("payChart"), byPayment);
   const trailing = lastMonths(6, ym);
   renderTrendBar($("trendChart"), trailing, monthlyTotals(allExpenses, trailing));
+
+  const incomeActivity = accountActivity.filter((a) => a.kind === "income");
+  const ive = incomeVsExpense(incomeActivity, allExpenses, trailing);
+  renderTrendBar($("incomeExpenseChart"), trailing, ive.map((r) => r.expense), {
+    label: "Income", data: ive.map((r) => r.income), color: "#34d399",
+  });
+  const selectedMonth = ive.find((r) => r.month === ym);
+  $("savingsRateStat").textContent = selectedMonth && selectedMonth.savingsRate != null
+    ? signedPct(Math.round(selectedMonth.savingsRate * 1000) / 10)
+    : "—";
 }
 
 // ---- MONTH REPORT EXPORT ---------------------------------------------------
@@ -3856,7 +4787,7 @@ td,th{padding:6px 8px;border-bottom:1px solid #ddd;text-align:left;font-size:13p
 // pattern acctBank already uses for bank_name. Category values in the DB are
 // therefore whatever the user actually typed, not one of these fixed
 // strings - don't add a CHECK constraint or validate against this list.
-// Set drawn from prior subscription/bill-category research.
+// Set drawn from researched billing conventions.
 const SUBSCRIPTION_CATEGORY_SUGGESTIONS = [
   "Utilities", "Housing", "Insurance", "Streaming & Media", "Software & Cloud",
   "Memberships & Dues", "Subscription Commerce", "Financial & Fees",
@@ -3878,6 +4809,13 @@ async function loadSubscriptions() {
   // user invented once show back up as a suggestion next time.
   const cats = [...new Set([...SUBSCRIPTION_CATEGORY_SUGGESTIONS, ...subscriptions.map((s) => s.category).filter(Boolean)])].sort();
   $("subCategorySuggestions").innerHTML = cats.map((c) => `<option value="${esc(c)}"></option>`).join("");
+}
+
+async function loadIncome() {
+  const { data, error } = await sb.from("income").select("*").order("next_expected", { ascending: true });
+  if (error) { $("incomeList").innerHTML = `<p class="muted">${esc(error.message)}</p>`; return; }
+  incomeSources = data || [];
+  renderIncomeList();
 }
 
 // A subscription's next_renewal reaching today means the real-world charge
@@ -3957,7 +4895,63 @@ async function autoLogDueSubscriptions() {
   }
 }
 
-// ---- RECURRING-EXPENSE DETECTION (README appendix open decision) -----------
+// Exact mirror of autoLogDueSubscriptions() above, deliberately - runs
+// unprompted on every app load, no confirm-first step (checked the real
+// subscription auto-logging behavior before assuming otherwise; there
+// isn't one). A received paycheck increases an asset, so this uses
+// applyAssetDelta(+1) instead of the expense-shaped insert + -1 delta
+// subscriptions use, and logs to account_activity (kind: "income") rather
+// than expenses, since income isn't spending - everything else (the
+// per-source catch-up loop, the 36-cycle cap, updating next_expected only
+// if it actually moved) is the same shape.
+async function autoLogDueIncome() {
+  const today = new Date().toISOString().slice(0, 10);
+  let loggedCount = 0;
+
+  for (const src of incomeSources) {
+    if (!src.is_active || !src.next_expected || !src.account_id) continue;
+    const account = accounts.find((a) => a.id === src.account_id);
+    if (!account || account.archived_at || !account.linked_asset_id) continue;
+    const amount = Number(src.amount);
+
+    // one_time never advances (advanceIncomeDate returns it unchanged),
+    // so it's handled as its own single-shot case rather than the
+    // while-loop below - looping it would either infinite-loop (bounded
+    // only by the 36-cycle cap) or double-log the same deposit repeatedly
+    // across future app loads. Deactivating it here is what actually
+    // stops that, not just the cap.
+    if (src.cadence === "one_time") {
+      if (src.next_expected > today) continue;
+      await applyAssetDelta(src.account_id, null, amount, +1);
+      await logActivity("income", src.source, amount, src.next_expected, src.account_id);
+      loggedCount++;
+      await sb.from("income").update({ is_active: false }).eq("id", src.id);
+      continue;
+    }
+
+    let expected = src.next_expected;
+    let cycles = 0;
+    while (expected <= today && cycles < 36) {
+      await applyAssetDelta(src.account_id, null, amount, +1);
+      await logActivity("income", src.source, amount, expected, src.account_id);
+      loggedCount++;
+      expected = advanceIncomeDate(expected, src.cadence, src.semimonthly_day_1, src.semimonthly_day_2);
+      cycles++;
+    }
+    if (expected !== src.next_expected) {
+      await sb.from("income").update({ next_expected: expected }).eq("id", src.id);
+    }
+  }
+
+  if (loggedCount) {
+    await loadAssets();
+    await loadIncome();
+    toast(`Logged ${loggedCount} income deposit${loggedCount === 1 ? "" : "s"} automatically`);
+  }
+}
+
+// ---- RECURRING-EXPENSE DETECTION (README appendix open decision, ROADMAP.md
+// Log/Quick Add #1) --------------------------------------------------------
 // Depends on both allExpenses and subscriptions, which load in parallel in
 // init() (Promise.all) - called from the end of both loadExpenses() and
 // loadSubscriptions() so it re-renders correctly once whichever finishes
@@ -3990,7 +4984,8 @@ function renderRecurringCandidates() {
 }
 
 // ---- DISCOUNT DISCOVERY (README §3.7 / F6) ---------------------------------
-// One question per plan_type eligibilityUpsells() can nudge toward.
+// One question per plan_type eligibilityUpsells() can nudge toward
+// eligibility fields.
 const UPSELL_PLAN_LABEL = {
   military: "Are you in the military?",
   first_responder: "Are you a first responder?",
@@ -4035,7 +5030,7 @@ function renderDeals() {
   // row per matched plan type, same "tap to open profile" pattern as the
   // student upsell above. Currently always empty in practice, since no
   // real catalog rows exist yet for these plan types (seeding real
-  // researched prices was explicitly deferred); the
+  // researched prices was explicitly deferred - see ROADMAP.md); the
   // mechanism is complete and will start surfacing rows the moment real
   // catalog data exists.
   const byPlanType = new Map();
@@ -4076,6 +5071,7 @@ function renderDealFindings() {
   if (!card) return;
   if (!DEAL_FINDINGS_ENABLED) { card.classList.add("hidden"); return; }
   card.classList.remove("hidden");
+  renderAgentFreshness("deal-agent", "dealFindingsFreshness", "dealFindingsWarning");
 
   const activeNames = subscriptions.filter((s) => s.is_active).map((s) => s.name);
   const matches = dealFindings.filter((f) => activeNames.some((name) => matchService(name, f.service)));
@@ -4097,6 +5093,7 @@ function renderDealFindings() {
         <div>
           <div>${esc(f.service)}${f.plan_type ? " · " + esc(f.plan_type) : ""}</div>
           <div class="meta">${price}${f.eligibility ? " (" + esc(f.eligibility) + ")" : ""} ${link}</div>
+          ${f.status === "candidate" && f.extracted_by === "regex" ? `<div class="muted" style="font-size:11px">pattern match${f.raw_snippet ? " - " + esc(f.raw_snippet) : ""}</div>` : ""}
         </div>
         <span class="amt">${actions}</span>
       </div>`;
@@ -4109,7 +5106,7 @@ function renderDealFindings() {
   });
 }
 
-// F6 Phase E - promoting copies a
+// Promoting a candidate deal copies a
 // finding's fields into subscription_catalog (a plain insert, not
 // atomic with the status update below; low risk for this app's ~2-user
 // trust model, same as the rest of this app's multi-step writes) and
@@ -4282,6 +5279,103 @@ $("deleteSubBtn").onclick = async () => {
   closeSubForm();
   await loadSubscriptions();
   toast("Subscription/bill deleted");
+};
+
+// ---- INCOME SOURCES (structurally mirrors subscriptions above) -----------
+function renderIncomeList() {
+  const sorted = [...incomeSources].sort((a, b) => (b.is_active - a.is_active) || a.source.localeCompare(b.source));
+  $("incomeList").innerHTML = sorted.length
+    ? sorted.map((s) => `
+      <div class="exp" data-income="${s.id}" style="${s.is_active ? "" : "opacity:.5"}">
+        <div>
+          <div>${esc(s.source)}${s.is_active ? "" : " · (inactive)"}</div>
+          <div class="meta">${cap(s.cadence.replace("_", " "))}${s.next_expected ? " · next " + s.next_expected : ""}${acctName(s.account_id) ? " · " + esc(acctName(s.account_id)) : ""}</div>
+        </div>
+        <span class="amt">${fmt(s.amount)}</span>
+      </div>`).join("")
+    : `<p class="muted">No income sources yet - add one above.</p>`;
+
+  document.querySelectorAll("#incomeList [data-income]").forEach((el) => {
+    el.onclick = () => {
+      const src = incomeSources.find((x) => x.id === el.dataset.income);
+      if (src) openIncomeForm(src);
+    };
+  });
+}
+
+function updateIncomeSemimonthlyVisibility() {
+  $("incomeSemimonthlyRow").classList.toggle("hidden", $("incCadence").value !== "semimonthly");
+}
+$("incCadence").addEventListener("change", updateIncomeSemimonthlyVisibility);
+
+const openNewIncomeForm = () => openIncomeForm(null);
+$("addIncomeBtn").onclick = openNewIncomeForm;
+$("cancelIncomeBtn").onclick = closeIncomeForm;
+
+function openIncomeForm(src) {
+  editingIncome = src;
+  $("incomeFormTitle").textContent = src ? "Edit income source" : "New income source";
+  $("incSource").value = src?.source ?? "";
+  $("incAmount").value = src?.amount ?? "";
+  $("incCadence").value = src?.cadence ?? "monthly";
+  $("incSemimonthlyDay1").value = src?.semimonthly_day_1 ?? "";
+  $("incSemimonthlyDay2").value = src?.semimonthly_day_2 ?? "";
+  $("incNextExpected").value = src?.next_expected ?? "";
+  $("incAccount").value = src?.account_id ?? "";
+  $("incActive").checked = src ? !!src.is_active : true;
+  $("incNotes").value = src?.notes ?? "";
+  $("deleteIncomeBtn").classList.toggle("hidden", !src);
+  updateIncomeSemimonthlyVisibility();
+  $("incomeForm").classList.remove("hidden");
+  $("incomeForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+function closeIncomeForm() { $("incomeForm").classList.add("hidden"); editingIncome = null; }
+
+$("saveIncomeBtn").onclick = async () => {
+  const source = $("incSource").value.trim();
+  const amount = parseFloat($("incAmount").value);
+  if (!source) { flagField("incSource"); return toast("Source required"); }
+  if (!amount || amount <= 0) { flagField("incAmount"); return toast("Enter a valid amount"); }
+  const cadence = $("incCadence").value;
+  let semimonthlyDay1 = null;
+  let semimonthlyDay2 = null;
+  if (cadence === "semimonthly") {
+    semimonthlyDay1 = parseInt($("incSemimonthlyDay1").value, 10) || null;
+    semimonthlyDay2 = parseInt($("incSemimonthlyDay2").value, 10) || null;
+    if (!semimonthlyDay1 || !semimonthlyDay2) {
+      flagField(["incSemimonthlyDay1", "incSemimonthlyDay2"]);
+      return toast("Enter both pay days for a semimonthly source");
+    }
+  }
+  const row = {
+    source, amount, cadence,
+    semimonthly_day_1: semimonthlyDay1,
+    semimonthly_day_2: semimonthlyDay2,
+    next_expected: $("incNextExpected").value || null,
+    account_id: $("incAccount").value || null,
+    is_active: $("incActive").checked,
+    notes: $("incNotes").value.trim() || null,
+  };
+  $("saveIncomeBtn").disabled = true;
+  const q = editingIncome
+    ? sb.from("income").update(row).eq("id", editingIncome.id)
+    : sb.from("income").insert(row);
+  const { error } = await q;
+  $("saveIncomeBtn").disabled = false;
+  if (error) { flagField("incSource"); return toast(error.message); }
+  closeIncomeForm();
+  await loadIncome();
+  toast(editingIncome ? "Income source updated" : "Income source added");
+};
+
+$("deleteIncomeBtn").onclick = async () => {
+  if (!editingIncome) return;
+  if (!(await confirmModal("This can't be undone.", { title: `Delete ${editingIncome.source}?` }))) return;
+  const { error } = await sb.from("income").delete().eq("id", editingIncome.id);
+  if (error) return toast(error.message);
+  closeIncomeForm();
+  await loadIncome();
+  toast("Income source deleted");
 };
 
 // ---- PROFILE (README §1.2, feeds Phase 4 discount matching) ----------------

@@ -1,7 +1,9 @@
 {
   "name": "personal-finance-tracker",
+  "main": "worker.js",
   "compatibility_date": "2026-08-04",
   "assets": {
-    "directory": "./app"
+    "directory": "./app",
+    "binding": "ASSETS"
   }
 }

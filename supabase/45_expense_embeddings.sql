@@ -1,6 +1,7 @@
 -- RAG retrieval for "Ask about your spending" (Reports page Q&A). Lets the
 -- Q&A feature answer questions about history older than the recent 150-
--- transaction/6-month window buildQaContext() already sends (additive,
+-- transaction/6-month window buildQaContext() already sends - see
+-- the app's own code comments for the full design rationale (additive,
 -- not a replacement; content-hash delta detection instead of updated_at,
 -- since expenses has no edit-tracking column).
 --

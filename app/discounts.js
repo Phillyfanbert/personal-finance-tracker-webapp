@@ -134,7 +134,7 @@ export function studentUpsell(subscriptions, catalog, profile) {
 // re-deriving each profile-field check, so this and findDeals/isEligible
 // can never silently disagree about what "eligible" means for a given
 // plan_type. Currently has no catalog data to match against (seeding real
-// researched prices was explicitly deferred), so this
+// researched prices was explicitly deferred - see ROADMAP.md), so this
 // returns [] in practice today; the mechanism is complete and tested, it's
 // just waiting on data, same shape studentUpsell() itself was in before
 // any student catalog rows existed.

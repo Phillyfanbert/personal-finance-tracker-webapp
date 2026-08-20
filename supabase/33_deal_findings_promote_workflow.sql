@@ -1,4 +1,5 @@
--- F6 Phase E: review/promote workflow. Both tables
+-- Review/promote workflow (Profile & Discount
+-- Discovery feature). Both tables
 -- were deliberately read-only from the client until now (see
 -- 02_rls.sql/04_deal_findings.sql's own comments: "writable by nobody via
 -- the API", "no insert/update/delete policy -> the anon/PWA client can

@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
 # ============================================================================
-# One-shot SERVER MACHINE bootstrap - run this on whichever machine is
-# colocated with Ollama, from the tools/ directory. Idempotent: safe to
-# re-run after a partial failure or to pick up a change.
+# One-shot SERVER MACHINE bootstrap - run this on your own home/server
+# machine (whichever one is colocated with Ollama), from the tools/ directory.
+# Idempotent: safe to re-run after a partial failure or to pick up a change.
 #
-# Sets up the whole home-machine side of this app's optional live-data
-# pipeline (F6 deal discovery + live asset pricing + RAG retrieval all
-# share this same setup):
+# Sets up the shared prerequisites that used to block both live deal
+# discovery and live asset pricing:
 #   1. tools/.env.deal-agent (prompts for the Supabase service_role key -
 #      never put it in this script or in chat, it bypasses RLS entirely)
 #   2. SearXNG's one-time settings.yml edits (JSON format + a real secret_key)
 #   3. tools/gemma-auth-proxy.js running persistently as a LaunchAgent, and
 #      the existing Cloudflare Tunnel LaunchAgent repointed at it instead of
-#      Ollama directly - a bare quick tunnel has no auth in front of it, so
-#      anyone who found the URL could hit your home GPU for free; this
-#      closes that gap with a shared-secret header the tunnel now requires
+#      Ollama directly (see the "Gemma tunnel lockdown" session note for why)
 #   4. Weekly launchd schedules for run-deal-agent.sh and run-price-agent.sh,
-#      deliberately staggered - both scripts bring up/tear down the SAME
-#      named SearXNG container, so running them concurrently would have one
-#      script's cleanup trap kill SearXNG out from under the other mid-run.
+#      now on genuinely DIFFERENT calendar days (Sunday / Wednesday,
+#      PRICE_AGENT_WEEKDAY), not just different hours of the same day - an
+#      earlier version of this comment described staggered hours on the
+#      same Sunday as sufficient spacing (leftover from when both scripts
+#      shared a SearXNG container, since removed in the 2026-08-14
+#      Tavily+Gemini migration), but that never addressed the real shared
+#      constraint: Gemini's 20-requests/day free quota resets per calendar
+#      day, not per hours-apart, so both scripts wanting Gemini calls on
+#      the same Sunday could (and, confirmed live 2026-08-16, did) collide
+#      regardless of the hour. See PRICE_AGENT_WEEKDAY's own comment
+#      further down for the full story.
 #   5. An hourly launchd schedule for embed-expenses.js (RAG retrieval for
 #      the Reports page's "Ask about your spending" Q&A - see
 #      supabase/45_expense_embeddings.sql) - much tighter than the weekly
@@ -27,6 +32,15 @@
 #      Gemma round trip, so a frequent run is cheap, and new expenses
 #      should become searchable soon after they're added rather than up to
 #      a week later.
+#   6. A tight (default 15-minute) launchd schedule for price-agent.js's
+#      FAST_ONLY mode (com.price-agent.fast, run-price-agent-fast.sh) -
+#      real stock-ticker prices only, straight to Finnhub with no
+#      Tavily/Gemini step at all, so it can run far more often than the
+#      full weekly pipeline without touching either service's constrained
+#      free-tier budget. This is what makes the Investments tab's real
+#      prices/net worth track the market closely instead of up to a week
+#      stale - see price-agent.js's own header comment for the full
+#      before/after call-volume accounting.
 #
 # Usage:
 #   cd tools
@@ -34,19 +48,21 @@
 #
 # Optional env overrides:
 #   GEMMA_PROXY_SECRET   - must match app/config.js's GEMMA_AUTH_KEY and the
-#                           Cloudflare dashboard's GEMMA_AUTH_KEY exactly, or
-#                           the app's real requests will get 401s from the
-#                           proxy. Auto-generated with openssl if you don't
-#                           pass one - the script prints whatever value it
-#                           ends up using, copy that into both config spots.
-#                           Pass the SAME value explicitly on any future
-#                           re-run (or save what got generated), otherwise a
-#                           fresh random secret each run will stop matching
-#                           what you already put in config.js/the dashboard.
-#   DEAL_AGENT_HOUR/MIN, PRICE_AGENT_HOUR/MIN - launchd schedule (defaults
-#                           Sunday 03:00 and Sunday 05:00, local time)
+#                           Cloudflare dashboard's GEMMA_AUTH_KEY, so it
+#                           defaults to the one already generated for this
+#                           project rather than a fresh random value that
+#                           would silently stop matching them.
+#   DEAL_AGENT_HOUR/MIN, PRICE_AGENT_HOUR/MIN, PRICE_AGENT_WEEKDAY -
+#                           launchd schedule for the two weekly Gemini-
+#                           using runs (defaults Sunday 03:00 and
+#                           Wednesday 05:00, local time - deliberately
+#                           different days, see PRICE_AGENT_WEEKDAY's own
+#                           comment further down for why)
 #   EMBED_EXPENSES_INTERVAL_SECONDS - how often embed-expenses.js runs
 #                           (default 3600 = hourly)
+#   PRICE_AGENT_FAST_INTERVAL_SECONDS - how often price-agent.js's
+#                           FAST_ONLY (Finnhub-only) mode runs (default
+#                           900 = 15 minutes)
 # ============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -59,12 +75,50 @@ DEAL_AGENT_HOUR="${DEAL_AGENT_HOUR:-3}"
 DEAL_AGENT_MIN="${DEAL_AGENT_MIN:-0}"
 PRICE_AGENT_HOUR="${PRICE_AGENT_HOUR:-5}"
 PRICE_AGENT_MIN="${PRICE_AGENT_MIN:-0}"
+# Deliberately NOT Sunday (deal-agent.js's own day, weekday 0 below) - found
+# live 2026-08-16 that scheduling both weekly Gemini-using scripts on the
+# SAME calendar day meant they competed for one shared 20-requests/day
+# free-tier quota, which is what caused deal-agent.js to fail 8-9 of 10
+# real queries. Gemini's quota resets per calendar day, not per hours-
+# apart, so same-day scheduling can't avoid this regardless of the hour.
+# 3 = Wednesday (launchd Weekday: 0=Sunday...6=Saturday) - conflict-free
+# with everything else scheduled (the interval/day-of-month jobs below
+# don't touch Gemini, or don't care about weekday at all).
+PRICE_AGENT_WEEKDAY="${PRICE_AGENT_WEEKDAY:-3}"
 EMBED_EXPENSES_INTERVAL_SECONDS="${EMBED_EXPENSES_INTERVAL_SECONDS:-3600}"
-
-echo "Using GEMMA_PROXY_SECRET: ${GEMMA_PROXY_SECRET}"
-echo "(copy this into app/config.js's GEMMA_AUTH_KEY and the Cloudflare dashboard's GEMMA_AUTH_KEY - see the env override notes above)"
+PRICE_AGENT_FAST_INTERVAL_SECONDS="${PRICE_AGENT_FAST_INTERVAL_SECONDS:-900}"
+MONTHLY_REPORT_DAY="${MONTHLY_REPORT_DAY:-1}"
+MONTHLY_REPORT_HOUR="${MONTHLY_REPORT_HOUR:-6}"
+MONTHLY_REPORT_MIN="${MONTHLY_REPORT_MIN:-0}"
+# Weekdays only, after the US close. Unlike every other job here the
+# recap has a real reason to care what time it is: it summarizes a
+# finished trading session, so running it mid-session would recap a
+# half-finished day. 16:30 assumes the server machine's own clock is
+# US Eastern - override if it isn't. It still keys off the latest
+# trade_date actually in daily_prices rather than the calendar, so an
+# early or repeated run is harmless, just less complete.
+DAILY_RECAP_HOUR="${DAILY_RECAP_HOUR:-16}"
+DAILY_RECAP_MIN="${DAILY_RECAP_MIN:-30}"
 
 log() { echo "== $* =="; }
+
+# launchctl bootout is asynchronous - an immediate bootstrap of the same
+# label right after can fail with "Bootstrap failed: 5: Input/output error"
+# even though the exact same bootstrap call succeeds a moment later
+# (confirmed live: every one of this script's 4 bootout+bootstrap sites hit
+# this on a real run, and a manual retry a couple seconds afterward worked
+# every time with no other change). One retry after a short pause is enough
+# in practice - this isn't launchd behaving randomly, just not being fully
+# unloaded yet at the instant bootout's own command returns.
+bootout_and_bootstrap() {
+  local label="$1" plist="$2"
+  launchctl bootout "$UID_GUI/${label}" 2>/dev/null || true
+  sleep 1
+  if ! launchctl bootstrap "$UID_GUI" "$plist" 2>/dev/null; then
+    sleep 2
+    launchctl bootstrap "$UID_GUI" "$plist"
+  fi
+}
 
 log "Checking prerequisites"
 command -v docker >/dev/null || { echo "docker not found - install Docker Desktop or OrbStack first."; exit 1; }
@@ -79,11 +133,8 @@ if [ -f "$ENV_FILE" ]; then
   log ".env.deal-agent already exists, leaving it as-is (delete it first to regenerate)"
 else
   log "Creating .env.deal-agent"
-  read -r -p "Supabase project URL (https://YOUR-PROJECT-REF.supabase.co): " SB_URL
-  if [ -z "$SB_URL" ]; then
-    echo "No project URL entered - aborting." >&2
-    exit 1
-  fi
+  read -r -p "Supabase project URL (e.g. https://YOUR_PROJECT_REF.supabase.co): " SB_URL
+  [ -n "$SB_URL" ] || { echo "A Supabase project URL is required."; exit 1; }
   read -r -s -p "Supabase SERVICE_ROLE key (input hidden, from Dashboard > Project Settings > API Keys): " SB_KEY
   echo
   if [ -z "$SB_KEY" ]; then
@@ -116,6 +167,17 @@ if [ -f "$SETTINGS" ]; then
     echo "settings.yml already has a formats: line - leaving it."
   else
     log "Enabling JSON output format in settings.yml"
+    # The bundled settings.yml a fresh docker-compose bootstrap produces has
+    # gotten much slimmer across SearXNG image versions than this script
+    # originally assumed - confirmed live it can be as little as
+    # use_default_settings: true plus a server: block, with no top-level
+    # search: key at all to insert under. use_default_settings: true means
+    # any top-level key added here (search:, same as server: already is)
+    # gets merged with the image's real defaults rather than replacing them
+    # wholesale - verified live (a real docker compose up + a real
+    # ?format=json query against a freshly-appended search: block returned
+    # real JSON results), so appending a brand new section when none exists
+    # is the correct fix, not just a fallback guess.
     python3 - "$SETTINGS" <<'PYEOF'
 import sys
 path = sys.argv[1]
@@ -130,9 +192,17 @@ for line in lines:
         out.append("    - html\n")
         out.append("    - json\n")
         inserted = True
+if not inserted:
+    if out and out[-1].strip() != "":
+        out.append("\n")
+    out.append("search:\n")
+    out.append("  formats:\n")
+    out.append("    - html\n")
+    out.append("    - json\n")
+    inserted = True
 with open(path, "w") as f:
     f.writelines(out)
-print("inserted formats: [html, json]" if inserted else "WARNING: no top-level 'search:' key found - add formats: [html, json] under it by hand")
+print("inserted formats: [html, json]")
 PYEOF
   fi
 
@@ -192,8 +262,7 @@ cat > "$PROXY_PLIST" <<EOF
 </dict>
 </plist>
 EOF
-launchctl bootout "$UID_GUI/com.gemma-auth-proxy" 2>/dev/null || true
-launchctl bootstrap "$UID_GUI" "$PROXY_PLIST"
+bootout_and_bootstrap "com.gemma-auth-proxy" "$PROXY_PLIST"
 sleep 1
 if curl -sf -m 3 -o /dev/null -w '' -X POST http://localhost:11435/api/generate -H 'Content-Type: application/json' -H "X-Gemma-Key: ${GEMMA_PROXY_SECRET}" -d '{"model":"gemma4:e4b","prompt":"ping","stream":false}'; then
   echo "Proxy is up and forwarding real requests on :11435."
@@ -207,8 +276,7 @@ if [ -f "$TUNNEL_PLIST" ]; then
     log "Repointing the Cloudflare Tunnel at the proxy (11434 -> 11435)"
     cp "$TUNNEL_PLIST" "$TUNNEL_PLIST.bak"
     sed -i '' 's#localhost:11434#localhost:11435#' "$TUNNEL_PLIST"
-    launchctl bootout "$UID_GUI/com.cloudflared.gemma-tunnel" 2>/dev/null || true
-    launchctl bootstrap "$UID_GUI" "$TUNNEL_PLIST"
+    bootout_and_bootstrap "com.cloudflared.gemma-tunnel" "$TUNNEL_PLIST"
     sleep 3
     NEW_URL="$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/cloudflared-gemma.log | tail -1 || true)"
     if [ -n "$NEW_URL" ]; then
@@ -227,11 +295,17 @@ else
   echo "WARNING: ${TUNNEL_PLIST} not found - is the Cloudflare Tunnel LaunchAgent set up under a different name? Repoint it at http://localhost:11435 by hand."
 fi
 
-# ---- 4. Weekly scheduling for deal-agent / price-agent, staggered ---------
+# ---- 4. Weekly scheduling for deal-agent / price-agent, on different days -
+# weekday is a real parameter now, not hardcoded - previously both jobs
+# were pinned to Sunday inside this function regardless of what HOUR/MIN
+# were passed, which is exactly what caused the Gemini-quota collision
+# PRICE_AGENT_WEEKDAY's own comment above explains. Changing just the hour
+# would never have fixed it.
+WEEKDAY_NAMES=(Sun Mon Tue Wed Thu Fri Sat)
 install_weekly_agent() {
-  local label="$1" script="$2" hour="$3" minute="$4"
+  local label="$1" script="$2" weekday="$3" hour="$4" minute="$5"
   local plist="$LAUNCH_AGENTS_DIR/${label}.plist"
-  log "Installing ${label} (Sun ${hour}:$(printf '%02d' "$minute"))"
+  log "Installing ${label} (${WEEKDAY_NAMES[$weekday]} ${hour}:$(printf '%02d' "$minute"))"
   cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -247,7 +321,7 @@ install_weekly_agent() {
   <key>StartCalendarInterval</key>
   <dict>
     <key>Weekday</key>
-    <integer>0</integer>
+    <integer>${weekday}</integer>
     <key>Hour</key>
     <integer>${hour}</integer>
     <key>Minute</key>
@@ -260,11 +334,50 @@ install_weekly_agent() {
 </dict>
 </plist>
 EOF
-  launchctl bootout "$UID_GUI/${label}" 2>/dev/null || true
-  launchctl bootstrap "$UID_GUI" "$plist"
+  bootout_and_bootstrap "${label}" "$plist"
 }
-install_weekly_agent "com.deal-agent.weekly" "${TOOLS_DIR}/run-deal-agent.sh" "$DEAL_AGENT_HOUR" "$DEAL_AGENT_MIN"
-install_weekly_agent "com.price-agent.weekly" "${TOOLS_DIR}/run-price-agent.sh" "$PRICE_AGENT_HOUR" "$PRICE_AGENT_MIN"
+install_weekly_agent "com.deal-agent.weekly" "${TOOLS_DIR}/run-deal-agent.sh" "0" "$DEAL_AGENT_HOUR" "$DEAL_AGENT_MIN"
+install_weekly_agent "com.price-agent.weekly" "${TOOLS_DIR}/run-price-agent.sh" "$PRICE_AGENT_WEEKDAY" "$PRICE_AGENT_HOUR" "$PRICE_AGENT_MIN"
+
+# A fourth shape, genuinely not a reuse of the three above:
+# install_weekly_agent hardcodes ONE Weekday integer, and the recap needs
+# to fire Monday through Friday. launchd takes an ARRAY of
+# StartCalendarInterval dicts for exactly this, so this emits five - one
+# per weekday - rather than installing five separate labels.
+install_weekday_agent() {
+  local label="$1" script="$2" hour="$3" minute="$4"
+  local plist="$LAUNCH_AGENTS_DIR/${label}.plist"
+  log "Installing ${label} (weekdays ${hour}:$(printf '%02d' "$minute"))"
+  local entries=""
+  for weekday in 1 2 3 4 5; do
+    entries+="    <dict><key>Weekday</key><integer>${weekday}</integer><key>Hour</key><integer>${hour}</integer><key>Minute</key><integer>${minute}</integer></dict>
+"
+  done
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${script}</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <array>
+${entries}  </array>
+  <key>StandardOutPath</key>
+  <string>/tmp/${label}.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/${label}.log</string>
+</dict>
+</plist>
+EOF
+  bootout_and_bootstrap "${label}" "$plist"
+}
+install_weekday_agent "com.daily-recap.weekday" "${TOOLS_DIR}/run-daily-recap.sh" "$DAILY_RECAP_HOUR" "$DAILY_RECAP_MIN"
 
 # ---- 5. Frequent scheduling for embed-expenses.js (RAG retrieval) ---------
 # StartInterval (seconds, repeating) rather than StartCalendarInterval
@@ -296,12 +409,63 @@ install_interval_agent() {
 </dict>
 </plist>
 EOF
-  launchctl bootout "$UID_GUI/${label}" 2>/dev/null || true
-  launchctl bootstrap "$UID_GUI" "$plist"
+  bootout_and_bootstrap "${label}" "$plist"
 }
 install_interval_agent "com.embed-expenses.hourly" "${TOOLS_DIR}/run-embed-expenses.sh" "$EMBED_EXPENSES_INTERVAL_SECONDS"
 
+# ---- 6. Frequent scheduling for price-agent.js's FAST_ONLY mode ----------
+# Same install_interval_agent shape as embed-expenses.hourly above - real
+# ticker prices only, straight to Finnhub, cheap enough to run often (see
+# price-agent.js's own header comment for the call-volume accounting).
+install_interval_agent "com.price-agent.fast" "${TOOLS_DIR}/run-price-agent-fast.sh" "$PRICE_AGENT_FAST_INTERVAL_SECONDS"
+
+# ---- 7. Monthly scheduling for monthly-report.js --------------------------
+# A genuine third shape, not a reuse of install_weekly_agent (hardcodes a
+# Weekday key, no day-of-month concept) or install_interval_agent (a plain
+# StartInterval in seconds would drift off real calendar-month boundaries
+# over time, and doesn't map to "the month that just ended" the way a
+# fixed Day-of-month does). Previously had no launchd job at all - its own
+# header comment even said scheduling was "a one-line addition once you're
+# ready," which was never actually added; the Reports page's Monthly
+# report card could never show anything but "No monthly reports yet"
+# without someone running this by hand.
+install_monthly_agent() {
+  local label="$1" script="$2" day="$3" hour="$4" minute="$5"
+  local plist="$LAUNCH_AGENTS_DIR/${label}.plist"
+  log "Installing ${label} (day ${day} of each month, ${hour}:$(printf '%02d' "$minute"))"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${script}</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key>
+    <integer>${day}</integer>
+    <key>Hour</key>
+    <integer>${hour}</integer>
+    <key>Minute</key>
+    <integer>${minute}</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/${label}.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/${label}.log</string>
+</dict>
+</plist>
+EOF
+  bootout_and_bootstrap "${label}" "$plist"
+}
+install_monthly_agent "com.monthly-report.monthly" "${TOOLS_DIR}/run-monthly-report.sh" "$MONTHLY_REPORT_DAY" "$MONTHLY_REPORT_HOUR" "$MONTHLY_REPORT_MIN"
+
 log "Done"
-echo "Scheduled: deal-agent Sundays ${DEAL_AGENT_HOUR}:$(printf '%02d' "$DEAL_AGENT_MIN"), price-agent Sundays ${PRICE_AGENT_HOUR}:$(printf '%02d' "$PRICE_AGENT_MIN") (staggered on purpose - both scripts share one SearXNG container and tear it down on exit, so overlapping runs would kill each other's SearXNG mid-run). embed-expenses every ${EMBED_EXPENSES_INTERVAL_SECONDS}s (cheap thanks to content-hash delta detection - most runs do nothing)."
-echo "Test any agent right now with: DRY_RUN=1 ./run-deal-agent.sh   (or run-price-agent.sh / run-embed-expenses.sh)"
+echo "Scheduled: deal-agent ${WEEKDAY_NAMES[0]}s ${DEAL_AGENT_HOUR}:$(printf '%02d' "$DEAL_AGENT_MIN"), price-agent (full) ${WEEKDAY_NAMES[$PRICE_AGENT_WEEKDAY]}s ${PRICE_AGENT_HOUR}:$(printf '%02d' "$PRICE_AGENT_MIN") - deliberately different days, see PRICE_AGENT_WEEKDAY's own comment above for why. embed-expenses every ${EMBED_EXPENSES_INTERVAL_SECONDS}s (cheap thanks to content-hash delta detection - most runs do nothing). price-agent (FAST_ONLY, Finnhub-only real ticker prices) every ${PRICE_AGENT_FAST_INTERVAL_SECONDS}s. monthly-report day ${MONTHLY_REPORT_DAY} of each month at ${MONTHLY_REPORT_HOUR}:$(printf '%02d' "$MONTHLY_REPORT_MIN")."
+echo "Test any agent right now with: DRY_RUN=1 ./run-deal-agent.sh   (or run-price-agent.sh / run-price-agent-fast.sh / run-embed-expenses.sh / run-monthly-report.sh)"
 echo "Remember to flip DEAL_FINDINGS_ENABLED / PRICE_FINDINGS_ENABLED to true in app/config.js and the Cloudflare dashboard once you're ready to surface results in the UI. RAG retrieval for the Q&A needs no such flag - it's best-effort and just silently contributes nothing until embed-expenses.js has actually run once."

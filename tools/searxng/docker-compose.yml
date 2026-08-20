@@ -1,5 +1,5 @@
 # ============================================================================
-# SearXNG - F6 stretch (Phase B).
+# SearXNG - powers the live deal-search agent.
 # Deliberately NOT set to restart automatically: this stays stopped between
 # runs. tools/run-deal-agent.sh brings it up right before a run and tears it
 # down right after, so it never sits resident consuming RAM between the

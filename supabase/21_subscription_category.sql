@@ -1,4 +1,5 @@
--- Free-text category on a recurring subscription/bill. Deliberately no CHECK
+-- Free-text category on a recurring subscription/bill, per
+-- researched billing conventions. Deliberately no CHECK
 -- constraint (unlike accounts.type/assets.type/liabilities.type): a bill
 -- can be anything from "Utilities" to "Kid's piano lessons" and the user
 -- should be able to type any label rather than being boxed into a fixed

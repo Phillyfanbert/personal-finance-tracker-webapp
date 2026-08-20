@@ -1,0 +1,6 @@
+# Supabase publishable/anon key hardcoded in worker.js - not a secret by
+# Supabase's own design (Row Level Security is what actually protects
+# data, not keeping this string hidden), and it already ships client-side
+# via app/config.js in the deployed app. See worker.js's own header
+# comment for the full reasoning.
+worker.js:generic-api-key:12

@@ -1,5 +1,5 @@
 // ============================================================================
-// Vehicle depreciation (Option A).
+// Vehicle depreciation.
 // Pure, unit-testable - same style as networth.js/subscriptions.js.
 // ============================================================================
 

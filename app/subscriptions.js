@@ -120,8 +120,9 @@ function matchInterval(gaps) {
  * Requires 3+ occurrences (2 consistent gaps), not just a pair, so one
  * coincidental repeat doesn't trigger a false positive - the same
  * "verify against real edge cases" caution that caught the bank-name
- * matching bug. Amount must match exactly rather than
- * fuzzily, since most real bills charge the same amount every cycle.
+ * matching bug found during testing. Amount must match exactly rather than
+ * fuzzily, since most real bills charge the same amount every cycle
+ * (researched against real billing-cycle conventions).
  *
  * No persisted "dismiss": a candidate simply stops appearing once its
  * most recent occurrence is more than 1.5x the detected interval old (the

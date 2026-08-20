@@ -1,4 +1,5 @@
--- Essential vs. discretionary flag - just
+-- Essential vs. discretionary flag (Subscriptions/Bills
+-- feature) - just
 -- the flag itself. The "what could I cut" report it's meant to power
 -- doesn't exist yet and isn't part of this change; low value in
 -- isolation, higher value once paired with a feature that reads it.

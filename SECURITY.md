@@ -40,9 +40,11 @@ to commit, what isn't, and what tooling enforces the difference.
   secret before it's created.
 - **`.gitleaksignore`** - allowlists the one known-safe publishable-key
   fingerprint so the hook doesn't nag about it.
-- **GitHub secret scanning + push protection** - free once a repo is public
-  (Settings → Code security). A second, independent layer in case something
-  slips past gitleaks locally.
+- **GitHub secret scanning + push protection** (Settings → Code security) -
+  a second, independent layer in case something slips past gitleaks
+  locally. Available for free on public repos automatically; on a private
+  repo, confirm it's actually enabled in Settings rather than assuming it
+  carried over - coverage can differ by plan/account type.
 
 ## Setting up the pre-commit hook on a new clone
 

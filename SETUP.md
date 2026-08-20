@@ -71,9 +71,11 @@ Dashboard → **Connect** (top bar) or **Settings → API Keys**. Copy:
 > privileges, RLS still applies. Older docs saying "copy the `eyJ...` anon key"
 > refer to the legacy scheme.
 
-`app/config.js` is **gitignored** - it holds your real Supabase URL and key,
-and this repo is public, so a real copy of live credentials should never sit
-in git history. Instead, create your local copy from the committed template:
+`app/config.js` is **gitignored** - it holds your real Supabase URL and key.
+Never commit a real copy of live credentials to git history, whether the
+repo is public or private - treat this as a hard rule either way, not a
+public-repo-only precaution. Instead, create your local copy from the
+committed template:
 
 ```bash
 cd app
